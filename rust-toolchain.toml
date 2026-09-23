@@ -1,0 +1,6 @@
+[toolchain]
+# Pin to the rustup stable channel so that cargo build, cargo test, and
+# cargo clippy all use the same rustc. Without this file the system cargo
+# (1.93) and the snap/rustup clippy (1.96) write incompatible artifacts to
+# the same target directory.
+channel = "stable"

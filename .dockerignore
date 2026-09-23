@@ -1,0 +1,34 @@
+# Rust build artefacts — large and host-specific; the builder stage compiles
+# from scratch inside the container.
+target/
+
+# Git history — not needed inside any image layer.
+.git/
+.gitignore
+
+# Node artefacts for the UI.  The ui/Dockerfile runs npm ci inside the
+# container, so neither the host node_modules nor a prior dist/ output
+# should enter the build context.
+ui/node_modules/
+ui/dist/
+
+# Secret files — must NEVER enter an image layer.
+#
+# The repo's `env` file holds real credentials (mode 600) and uses `export`
+# prefixes; it is for shell use only and must never be copied into an image.
+# `.env` is the compose-readable version (KEY=value, no export); docker
+# compose passes it as env_file and does not copy it into the image either,
+# but excluding it here prevents accidental COPY instructions from picking
+# it up.
+env
+.env
+
+# Editor and IDE state.
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS noise.
+.DS_Store
+Thumbs.db

@@ -1,0 +1,60 @@
+[package]
+name = "webscout"
+version = "0.1.0"
+edition = "2024"
+description = "Search the web and return verified results: a generative model writes, TypeSafe's Jev verifies, Obscura fetches."
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+csv = "1.4.0"
+futures = "0.3.34"
+# `rustls` (the default provider) pulls aws-lc-sys, which is C and needs a musl
+# cross-compiler to link statically. `rustls-no-provider` plus ring keeps the whole
+# dependency tree pure Rust, which is what makes the static build possible.
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "gzip",
+    "rustls-no-provider",
+    "http2",
+    "charset",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "process",
+    # `net` is the TcpListener the --api server binds; nothing else needs it.
+    "net",
+] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
+regex = "1"
+# The `--api` server. Chosen over hand-rolling on hyper because routing, the JSON
+# extractor and streaming bodies are exactly what this needs and nothing else is
+# pulled in: `default-features = false` drops the macro, multipart and ws paths, and
+# hyper/tower/http were already in the tree via reqwest, so this adds six pure-Rust
+# crates (axum, axum-core, httpdate, matchit, serde_path_to_error, serde_urlencoded).
+# No C dependency, so the static musl build keeps working.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query"] }
+pdf-extract = "0.12.1"
+
+[profile.release]
+# A research run is dominated by network waiting, so optimise the binary for size
+# and link-time cleanup rather than for raw throughput.
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+# Tests only: `ServiceExt::oneshot` drives the axum router in-process, so the API
+# endpoints are exercised as HTTP without binding a port or reaching the network.
+# Already in the tree via reqwest/axum, and pure Rust.
+tower = { version = "0.5.3", default-features = false, features = ["util"] }

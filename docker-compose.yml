@@ -1,0 +1,54 @@
+services:
+
+  # ── API service ─────────────────────────────────────────────────────────────
+  # Reads all credentials from .env (see .env.example).
+  # NOT published on the host — only the ui service is reachable externally.
+  # Without obscura the only available search lane is Jina.  To supply a host
+  # obscura, uncomment the volumes and environment overrides below.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    env_file: .env
+    environment:
+      # XDG_CACHE_HOME is set explicitly so the search cache lands on the
+      # named volume regardless of the container's home directory.
+      XDG_CACHE_HOME: /cache
+    volumes:
+      - search_cache:/cache
+      # ── Obscura (optional) ──────────────────────────────────────────────
+      # The api image does not ship obscura.  To use a host obscura, mount
+      # the directory that contains both the `obscura` and `obscura-worker`
+      # binaries onto /opt/obscura.  The Dockerfile adds /opt/obscura to PATH.
+      #
+      # Example:
+      #   - /usr/local/bin:/opt/obscura:ro
+      #
+      # If the mount contains other executables and you want to restrict PATH,
+      # set it explicitly in the environment section:
+      #   PATH: /opt/obscura:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── UI service ──────────────────────────────────────────────────────────────
+  # Serves the static frontend on port 3000 and proxies /api/ to the api
+  # service, so the browser makes same-origin requests only.
+  ui:
+    build:
+      context: ui
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  # The search cache survives container restarts.  webscout stores 6-hour
+  # cached DuckDuckGo and Jina results here to avoid hammering search engines
+  # on repeated or similar queries.
+  search_cache:

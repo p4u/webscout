@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light" />
+    <meta name="description" content="Search the web and get verified, grounded results." />
+    <title>webscout</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='14' cy='14' r='8' fill='none' stroke='%231a73e8' stroke-width='3'/%3E%3Cpath d='M20 20l7 7' stroke='%231a73e8' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app" class="app" data-phase="idle">
+      <header class="masthead" id="masthead">
+        <div class="masthead__inner">
+          <a class="brand" href="./" id="brand" aria-label="webscout home">
+            <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
+              <circle cx="14" cy="14" r="8.5" fill="none" stroke="currentColor" stroke-width="2.6" />
+              <path d="M20.5 20.5 L27 27" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" />
+            </svg>
+            <span class="brand__name">webscout</span>
+          </a>
+          <p class="brand__tagline">Searches the web. Returns only what it can verify.</p>
+
+          <form class="search" id="search-form" autocomplete="off">
+            <div class="search__field">
+              <svg class="search__icon" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2" />
+                <path d="M15.5 15.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              </svg>
+              <input
+                id="query"
+                name="query"
+                type="text"
+                class="search__input"
+                placeholder="Ask anything, or describe a list to harvest"
+                aria-label="Search query"
+                enterkeyhint="search"
+                spellcheck="false"
+              />
+              <button type="button" class="search__clear" id="clear-query" aria-label="Clear query" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              </button>
+              <button type="submit" class="btn btn--primary search__submit" id="submit">Search</button>
+              <button type="button" class="btn btn--stop search__stop" id="stop" hidden>Stop</button>
+            </div>
+
+            <div class="controls" id="basic-controls" aria-label="Search options"></div>
+
+            <details class="advanced" id="advanced">
+              <summary class="advanced__summary">
+                <svg class="advanced__chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <span>Advanced settings</span>
+                <span class="advanced__count" id="changed-count" hidden></span>
+              </summary>
+              <div class="advanced__body">
+                <div class="advanced__grid" id="advanced-controls"></div>
+                <div class="advanced__actions">
+                  <button type="button" class="btn btn--text" id="reset">Reset to defaults</button>
+                </div>
+              </div>
+            </details>
+          </form>
+        </div>
+      </header>
+
+      <main class="main" id="main">
+        <div class="stack" id="stack">
+          <section class="panel panel--error" id="error-panel" hidden role="alert" aria-live="assertive">
+            <div class="panel__row">
+              <svg class="panel__icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7.5v5.5M12 16.2v.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              <div class="panel__text">
+                <p class="panel__title" id="error-title">Something went wrong</p>
+                <p class="panel__detail" id="error-detail"></p>
+              </div>
+              <button type="button" class="btn btn--tonal" id="retry">Retry</button>
+            </div>
+          </section>
+
+          <section class="activity" id="activity" hidden aria-live="polite">
+            <div class="activity__head">
+              <span class="activity__pulse" id="activity-pulse" aria-hidden="true"></span>
+              <span class="activity__status" id="activity-status">Starting…</span>
+              <span class="activity__spacer"></span>
+              <span class="activity__timer" id="timer">0.0s</span>
+              <button type="button" class="btn btn--text activity__toggle" id="activity-toggle" aria-expanded="true">Hide log</button>
+            </div>
+            <ol class="activity__list" id="activity-list"></ol>
+          </section>
+
+          <!-- Live token and cost meter. Fed by the stream's `usage` events while
+               the run is in flight and settled from the result's stats at the end,
+               so what is on screen is always what the run actually spent. -->
+          <section class="usage" id="usage" hidden aria-label="Tokens and cost">
+            <div class="usage__head">
+              <span class="usage__title">Tokens &amp; cost</span>
+              <span class="usage__total" id="usage-total"></span>
+            </div>
+            <div class="usage__rows" id="usage-rows"></div>
+          </section>
+
+          <section class="result" id="result" hidden>
+            <div class="result__head">
+              <span class="outcome" id="outcome" data-outcome="">—</span>
+              <div class="stats" id="stats"></div>
+              <div class="result__actions">
+                <button type="button" class="btn btn--tonal" id="copy">Copy markdown</button>
+                <div class="menu" id="download-menu">
+                  <button type="button" class="btn btn--tonal menu__trigger" id="download-trigger" aria-haspopup="true" aria-expanded="false">
+                    Download
+                    <svg viewBox="0 0 24 24" aria-hidden="true" class="menu__caret"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                  <div class="menu__list" id="download-list" role="menu" hidden></div>
+                </div>
+              </div>
+            </div>
+            <ul class="notes" id="notes" hidden></ul>
+            <article class="prose" id="prose"></article>
+          </section>
+        </div>
+      </main>
+
+      <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

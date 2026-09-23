@@ -1,0 +1,10 @@
+# The builder stage runs `npm ci` itself and writes its own dist/; copying the
+# host's copies in would be slow at best and wrong at worst (native deps, stale
+# bundles). Keep the build context to sources and manifests.
+node_modules
+dist
+.vite
+npm-debug.log*
+Dockerfile
+.dockerignore
+README.md
