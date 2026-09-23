@@ -2527,6 +2527,97 @@ fn triage_question_cost(i: usize) -> usize {
 /// the end sheds the weakest evidence first. Budgeting on the total rather than the
 /// item is the point: the limit is on the request, so the request is what must be
 /// measured.
+/// The separately-asked parts of an answer mission: every requested field
+/// except the one that names the subject.
+///
+/// An answer mission is not always one fact. "When was ElGamal presented as
+/// a paper, and provide the link to the paper" parses to
+/// `[name, publication_date, url]` — two deliverables — and the holistic
+/// `answered` noul scores the date alone at ≥ 0.7, which stopped the search
+/// before the link was ever looked for (measured 2026-09-23: 0 of 3 runs
+/// delivered the link, each stopping after 1–2 of its allowed rounds). The
+/// fields are already the parse's own statement of what was asked, so they
+/// are the parts; nothing new is inferred.
+fn answer_parts(mission: &Mission) -> Vec<String> {
+    let entity = if mission.entity_field.is_empty() {
+        mission.fields.first().map(String::as_str).unwrap_or("")
+    } else {
+        mission.entity_field.as_str()
+    };
+    mission
+        .fields
+        .iter()
+        .filter(|f| f.as_str() != entity)
+        .cloned()
+        .collect()
+}
+
+/// One noul per answer part: does the evidence supply THIS piece?
+///
+/// A URL-shaped part is taught that a passage's own `source` can be the
+/// answer. The link to a paper is most often the page the paper lives on,
+/// and that page states its own address nowhere in its text — the reader
+/// sees it in the address bar, which here is the `source` field.
+fn answer_part_question(field: &str) -> Value {
+    let words = field_words(field);
+    if matches!(cands::kind_for_field(field), Some(cands::Kind::Url)) {
+        noul(
+            &format!(
+                "Does `evidence` supply the {words} that `question` asks for — the address \
+                 of the specific thing asked about?"
+            ),
+            "An evidence item's text states that address, or an item's `source` IS the asked-about \
+             thing's own page (the paper's page on its publisher's site, the organisation's own \
+             site), so its `source` is the answer.",
+            "No item states the address and no item's `source` is the asked-about thing's own \
+             page: the items are about it, or cite it, without giving where it is.",
+        )
+    } else {
+        noul(
+            &format!("Does `evidence` supply the {words} that `question` asks for?"),
+            "A reader could state that part of the answer from the evidence alone, or the \
+             evidence authoritatively shows it does not exist.",
+            "The evidence leaves that part unresolved.",
+        )
+    }
+}
+
+/// What the writer is told about parts the judge found unanswered.
+///
+/// Without it the writer fills the gap with the nearest thing in the
+/// evidence: with the link part judged missing, it offered a university's
+/// lecture-notes PDF as "the link to the paper" — true that the file was a
+/// source, false that it was the paper, and the per-claim check cannot tell
+/// the difference because the sentence quotes a real source (measured
+/// 2026-09-23, ElGamal). Jev decided the part is missing; the writer is only
+/// told to say so.
+fn missing_parts_writer_note(open_parts: &[String]) -> Option<String> {
+    if open_parts.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = open_parts.iter().map(|f| field_words(f)).collect();
+    Some(format!(
+        "The passages have been judged NOT to supply: {}. State plainly that this was not \
+         found in the sources. Do not offer a related item in its place — a page that \
+         discusses or cites the thing asked about is not the thing itself.",
+        parts.join(", ")
+    ))
+}
+
+/// An answer is only as answered as its least-answered part.
+///
+/// The holistic verdict stays in the minimum on purpose: a mission with no
+/// separately-asked parts, or one whose part asks failed, reduces to it
+/// exactly, so single-fact questions behave as they always have. A failed
+/// part ask arrives here as absent, never as 1.0 — a failed guard is never
+/// an open door, but neither may it silently erase a part.
+fn answered_across_parts(answered: f64, parts: &[Option<f64>]) -> f64 {
+    parts
+        .iter()
+        .map(|p| p.unwrap_or(0.0))
+        .fold(answered, f64::min)
+}
+
 fn fit_evidence(evidence: &[Passage], per_item: usize, budget: usize) -> Vec<Value> {
     // Leave room for the questions, the query, and JSON overhead, all of which ride
     // along in the same request. The caller passes the observed budget so the
@@ -2560,6 +2651,23 @@ fn fit_evidence(evidence: &[Passage], per_item: usize, budget: usize) -> Vec<Val
 /// 0.5 is "more likely than not" on a calibrated noul, which is the right bar for
 /// a check whose remedy is one extra LLM call, not for one that discards evidence.
 pub(crate) const STALE_FLOOR: f64 = 0.5;
+
+/// At or above this `conflict`, the sources are treated as disagreeing: the
+/// report says so, and the writer is told to show the disagreement rather
+/// than pick a side. One constant for both so they cannot drift apart.
+pub(crate) const CONFLICT_FLOOR: f64 = 0.55;
+
+/// What the writer is told when Jev finds the sources in conflict.
+///
+/// Framed as a distinction to draw, not a vote to take, because the measured
+/// case was not two sources being wrong: "CRYPTO 1984" on the paper's page
+/// and "described in 1985" on Wikipedia are both true of different events
+/// (presented vs published), and the question asked about the first.
+pub(crate) const CONFLICT_WRITER_NOTE: &str = "The passages have been judged to disagree about the answer. Do not silently pick \
+     one version. If the versions describe different things — an event versus its \
+     publication, an announcement versus a release, a draft versus a final text — \
+     state each with its citation and say which one the question asks about. If they \
+     truly contradict each other, give both, cited, and say that the sources disagree.";
 
 /// When the whole-answer `unsupported` noul reaches this, the draft is
 /// re-written once and, if the re-draft stays above it, the outcome is
@@ -2902,13 +3010,23 @@ fn claim_tail(s: &str, mut j: usize) -> usize {
 /// thing the evidence is supposed to replace: the fabricated sentences in the
 /// measured example ("the fourth season will premiere in March 2027") are not
 /// absurd, they are merely absent.
+/// The yes-criterion counts an item's `source` as evidence of its own
+/// address. A paper's page never prints its own URL, so "the link to the
+/// paper is <that page>" was marked unsupported on a run whose answer was
+/// otherwise the best of the day — CRYPTO 1984 and the IEEE journal version,
+/// both linked (measured 2026-09-23, ElGamal).
 pub(crate) fn claim_question(slot: usize) -> Value {
     noul(
         &format!("Is the claim in `claims[{slot}]` supported by `evidence`?"),
-        "An evidence item states this claim or directly implies it.",
+        CLAIM_SUPPORTED,
         "No evidence item states this; it may be true in the world but it is not in the evidence.",
     )
 }
+
+const CLAIM_SUPPORTED: &str = "An evidence item states this claim or directly implies it. An \
+     item's `source` is evidence of its own address: a claim that an address is where some \
+     thing is published is supported when the item with that `source` is that thing's own \
+     page.";
 
 /// Serialized cost of one claim question, for batch planning.
 fn claim_question_cost(slot: usize) -> usize {
@@ -5241,7 +5359,7 @@ impl Scout {
             let ps = self
                 .timed(
                     "2 plan queries",
-                    self.plan_queries(mission, round, found, &tried, &productive),
+                    self.plan_queries(mission, round, found, &tried, &productive, &[]),
                 )
                 .await?;
             for q in &ps {
@@ -6499,6 +6617,9 @@ impl Scout {
         // re-screened every round.
         let mut seen_urls: HashSet<String> = HashSet::new();
         let mut fallback_rounds = 0usize;
+        // Parts of the question the last assessment found unanswered; the
+        // planner is told to aim at them (see `answer_parts`).
+        let mut missing: Vec<String> = Vec::new();
 
         for round in 1..=self.t().max_rounds.min(6) {
             report.stats.rounds = round;
@@ -6562,7 +6683,14 @@ impl Scout {
             } else {
                 self.timed(
                     "2 plan queries",
-                    self.plan_queries(mission, round, evidence.len(), &tried, &HashMap::new()),
+                    self.plan_queries(
+                        mission,
+                        round,
+                        evidence.len(),
+                        &tried,
+                        &HashMap::new(),
+                        &missing,
+                    ),
                 )
                 .await?
             };
@@ -6584,6 +6712,7 @@ impl Scout {
                 }
             }
             if queries.is_empty() {
+                tracing::info!(round, "answer search stopped: no new queries to issue");
                 break;
             }
 
@@ -6602,7 +6731,9 @@ impl Scout {
                 evidence.len(),
             );
 
-            let (gathered, pages) = self.gather_passages(mission, &queries, &seen_urls).await;
+            let (gathered, pages) = self
+                .gather_passages(mission, &queries, &mut seen_urls)
+                .await;
             report.stats.queries_issued += queries.len();
 
             for g in gathered {
@@ -6678,19 +6809,35 @@ impl Scout {
             if evidence.len() == before {
                 barren += 1;
                 if barren >= self.t().max_barren_rounds {
+                    tracing::info!(round, barren, "answer search stopped: barren rounds");
                     break;
                 }
             } else {
                 barren = 0;
             }
 
-            // Enough good evidence is a better stop signal than a round count.
+            // Enough good evidence is a better stop signal than a round count —
+            // but only evidence for EVERY part of the question. See
+            // `answer_parts`: the holistic verdict alone stopped the ElGamal
+            // run on the date and never searched for the link.
             if evidence.len() >= 6 {
                 let verdict = self
                     .timed("9 assess evidence", self.assess(mission, &evidence))
                     .await;
-                if verdict.map(|v| v.noul("answered") >= 0.7).unwrap_or(false) {
-                    break;
+                if let Some(v) = verdict {
+                    let (answered, open) = Self::answer_verdict(mission, &v);
+                    if answered >= 0.7 {
+                        tracing::info!(
+                            round,
+                            answered,
+                            "answer search stopped: evidence answers every part"
+                        );
+                        break;
+                    }
+                    if !open.is_empty() {
+                        tracing::info!(round, answered, missing = ?open, "answer search continues: parts still open");
+                    }
+                    missing = open;
                 }
             }
         }
@@ -6751,8 +6898,18 @@ impl Scout {
         let verdict = self
             .timed("9 assess evidence", self.assess(mission, &evidence))
             .await;
-        let answered = verdict.as_ref().map(|v| v.noul("answered")).unwrap_or(0.0);
+        let (answered, open_parts) = verdict
+            .as_ref()
+            .map(|v| Self::answer_verdict(mission, v))
+            .unwrap_or((0.0, Vec::new()));
         let conflict = verdict.as_ref().map(|v| v.noul("conflict")).unwrap_or(0.0);
+        if !open_parts.is_empty() {
+            let parts: Vec<String> = open_parts.iter().map(|f| field_words(f)).collect();
+            report.notes.push(format!(
+                "Not found in the evidence: {}. The rest of the question is answered below.",
+                parts.join(", ")
+            ));
+        }
 
         self.emit_progress(
             "synthesize",
@@ -6762,10 +6919,31 @@ impl Scout {
             evidence.len(),
         );
 
+        // Jev's conflict verdict reaches the writer, not just the report. It
+        // used to arrive only as a note under an answer that had already
+        // picked a side: the ElGamal paper's own page reads "CRYPTO 1984",
+        // Wikipedia reads "described in 1985", Jev scored conflict 0.75, and
+        // the writer — told nothing — answered "1985" to a question about
+        // when the paper was first PRESENTED (measured 2026-09-23). The
+        // judge still decides that the sources disagree; the writer is only
+        // told to show the disagreement instead of resolving it by fiat.
+        let mut writer_note = recency_note.clone();
+        if conflict >= CONFLICT_FLOOR {
+            if !writer_note.is_empty() {
+                writer_note.push(' ');
+            }
+            writer_note.push_str(CONFLICT_WRITER_NOTE);
+        }
+        if let Some(note) = missing_parts_writer_note(&open_parts) {
+            if !writer_note.is_empty() {
+                writer_note.push(' ');
+            }
+            writer_note.push_str(&note);
+        }
         let mut answer = self
             .timed(
                 "10 synthesize",
-                self.synthesize(mission, &evidence, &recency_note),
+                self.synthesize(mission, &evidence, &writer_note),
             )
             .await?;
 
@@ -6811,10 +6989,10 @@ impl Scout {
                 // The recency note rides along on the retry too: dropping it
                 // would re-blind the second draft to the judgment the first
                 // one had.
-                let retry_with_note = if recency_note.is_empty() {
+                let retry_with_note = if writer_note.is_empty() {
                     retry
                 } else {
-                    format!("{recency_note}\n\n{retry}")
+                    format!("{writer_note}\n\n{retry}")
                 };
                 match self
                     .timed(
@@ -6910,7 +7088,7 @@ impl Scout {
             ));
         }
 
-        if conflict >= 0.55 {
+        if conflict >= CONFLICT_FLOOR {
             report.notes.push(format!(
                 "Sources disagree (conflict {conflict:.2}). The passages contain claims \
                  that cannot all be true."
@@ -6948,6 +7126,10 @@ impl Scout {
             && report.stats.claims_checked > unsupported_claims.len()
         {
             report.outcome = Outcome::Partial;
+        }
+        // The specific note (which parts are missing) says this better when
+        // the parts are known; the general one covers the holistic case.
+        if report.outcome == Outcome::Partial && open_parts.is_empty() && answered < 0.35 {
             report.notes.push(
                 "Part of the question is answered and part is not: the answer below carries \
                  claims the evidence supports, but the assessment found the request only \
@@ -7232,6 +7414,13 @@ impl Scout {
     }
 
     async fn assess(&self, mission: &Mission, evidence: &[Passage]) -> Option<Answers> {
+        // One noul per separately-asked part rides in the same request; see
+        // `answer_parts`. Read back through `answer_verdict`.
+        let part_questions: Vec<(String, Value)> = answer_parts(mission)
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (format!("part{i}"), answer_part_question(f)))
+            .collect();
         self.jev
             .ask(
                 json!({
@@ -7239,7 +7428,7 @@ impl Scout {
                     "today": &self.today,
                     "evidence": fit_evidence(evidence, 2500, self.jev.request_budget_chars()),
                 }),
-                crate::typesafe::questions(vec![
+                crate::typesafe::questions(part_questions.into_iter().chain(vec![
                     (
                         "answered".into(),
                         noul(
@@ -7256,10 +7445,35 @@ impl Scout {
                             "They agree, cover different aspects, or do not overlap.",
                         ),
                     ),
-                ]),
+                ]).collect()),
             )
             .await
             .ok()
+    }
+
+    /// Read an `assess` verdict: how answered the question is across all its
+    /// parts, and which parts the evidence still leaves open.
+    ///
+    /// Jev judges each part; this code only combines (`answered_across_parts`)
+    /// and names what is missing, so the next round's planner can aim at it.
+    fn answer_verdict(mission: &Mission, verdict: &Answers) -> (f64, Vec<String>) {
+        let parts = answer_parts(mission);
+        let scores: Vec<Option<f64>> = (0..parts.len())
+            .map(|i| {
+                let id = format!("part{i}");
+                verdict.is_sane(&id).then(|| verdict.noul(&id))
+            })
+            .collect();
+        let missing = parts
+            .iter()
+            .zip(&scores)
+            .filter(|(_, s)| s.is_none_or(|p| p < 0.7))
+            .map(|(f, _)| f.clone())
+            .collect();
+        (
+            answered_across_parts(verdict.noul("answered"), &scores),
+            missing,
+        )
     }
 
     /// Write the answer from the cleared evidence.
@@ -7335,7 +7549,7 @@ impl Scout {
         &self,
         mission: &Mission,
         queries: &[String],
-        seen_urls: &HashSet<String>,
+        seen_urls: &mut HashSet<String>,
     ) -> (Vec<PagePassages>, Vec<crate::browser::PageContent>) {
         use futures::stream::{self, StreamExt};
 
@@ -7380,6 +7594,13 @@ impl Scout {
         }
 
         let urls: Vec<String> = keep.iter().map(|c| c.hit.url.clone()).collect();
+        // Marked seen when ATTEMPTED, not when read. The caller used to record
+        // only pages that came back with text, under their post-redirect URL,
+        // so a page that failed to read — or redirected — passed the seen
+        // filter again next round, re-won triage on the same snippet, and
+        // failed again: the ElGamal paper's DOI page on dl.acm.org cost a read
+        // slot in four consecutive rounds (measured 2026-09-23).
+        seen_urls.extend(urls.iter().cloned());
         let pages = self
             .timed("5 fetch pages", self.fetcher.fetch_many(&urls))
             .await;
@@ -8353,6 +8574,7 @@ impl Scout {
         found: usize,
         tried: &HashSet<String>,
         productive: &HashMap<String, usize>,
+        missing: &[String],
     ) -> Result<Vec<String>> {
         // Two separate lists, because asking for one list and hoping for a good mix
         // does not work. Observed failure: once one domain proved productive, the
@@ -8378,6 +8600,17 @@ impl Scout {
         }
         if let Some(t) = mission.target_count {
             context.push_str(&format!("WANTED: {t} items, HAVE: {found}\n"));
+        }
+        // Named by Jev's per-part assessment, not guessed: without it the
+        // planner re-searched what was already found (the ElGamal date) and
+        // never aimed at what was not (the link to the paper).
+        if !missing.is_empty() {
+            let parts: Vec<String> = missing.iter().map(|f| field_words(f)).collect();
+            context.push_str(&format!(
+                "STILL MISSING: the evidence so far does not supply {}. Aim the queries at \
+                 finding exactly that; the rest of the goal is already covered.\n",
+                parts.join(", ")
+            ));
         }
         if !tried.is_empty() {
             let mut sample: Vec<&String> = tried.iter().collect();
@@ -14404,6 +14637,57 @@ mod tests {
     }
 
     // F3: guard_fields keyword table.
+    /// A multi-part answer mission's parts are its requested fields minus the
+    /// subject, and the question is only as answered as its least-answered
+    /// part. The holistic noul alone scored "ElGamal, 1985" as answered and
+    /// the search stopped before the link was looked for.
+    #[test]
+    fn a_multi_part_question_is_answered_only_when_every_part_is() {
+        let m = mission_with("ElGamal paper", &[], &["name", "publication_date", "url"]);
+        assert_eq!(
+            answer_parts(&m),
+            vec!["publication_date".to_string(), "url".to_string()]
+        );
+
+        // Date found (0.95), link not (0.10): the holistic 0.9 must not win.
+        let combined = answered_across_parts(0.9, &[Some(0.95), Some(0.10)]);
+        assert!((combined - 0.10).abs() < 1e-9, "{combined}");
+        // Every part found: the holistic verdict governs.
+        let combined = answered_across_parts(0.8, &[Some(0.95), Some(0.9)]);
+        assert!((combined - 0.8).abs() < 1e-9, "{combined}");
+        // A failed part ask is not a pass.
+        assert_eq!(answered_across_parts(0.9, &[Some(0.95), None]), 0.0);
+        // A single-fact mission has no parts and behaves exactly as before.
+        assert_eq!(answered_across_parts(0.73, &[]), 0.73);
+        let single = mission_with("Vodafone CEO", &[], &["name"]);
+        assert!(answer_parts(&single).is_empty());
+    }
+
+    /// The writer hears about a part the judge found missing, by name, and is
+    /// told not to substitute; with nothing missing it hears nothing.
+    #[test]
+    fn the_writer_is_told_which_parts_are_missing() {
+        assert!(missing_parts_writer_note(&[]).is_none());
+        let note = missing_parts_writer_note(&["url".to_string()]).unwrap();
+        assert!(note.contains("NOT to supply: url"), "{note}");
+        assert!(note.contains("Do not offer a related item"), "{note}");
+        let note = missing_parts_writer_note(&["publication_date".into(), "url".into()]).unwrap();
+        assert!(note.contains("publication date, url"), "{note}");
+    }
+
+    /// The link to a paper is usually the page the paper lives on, and that
+    /// page never prints its own address: the part question must let the
+    /// passage's `source` be the answer, or no evidence could ever satisfy it.
+    #[test]
+    fn a_url_part_may_be_satisfied_by_the_source_itself() {
+        let q = answer_part_question("url").to_string();
+        assert!(q.contains("`source`"), "{q}");
+        assert!(q.contains("own page"), "{q}");
+        let q = answer_part_question("publication_date").to_string();
+        assert!(q.contains("publication date"), "{q}");
+        assert!(!q.contains("`source` IS"), "{q}");
+    }
+
     /// "link" is the ordinary English word for a URL, and dropping the field
     /// it names loses the request's own second half before the first search.
     /// The ElGamal question asked for a date and a link, kept only the date,
@@ -15428,10 +15712,17 @@ mod tests {
             q["instructions"],
             "Is the claim in `claims[3]` supported by `evidence`?"
         );
-        assert_eq!(
-            q["criteria"]["true"],
-            "An evidence item states this claim or directly implies it."
+        let yes = q["criteria"]["true"].as_str().unwrap();
+        assert!(
+            yes.starts_with("An evidence item states this claim or directly implies it."),
+            "{yes}"
         );
+        // A page's own address is evidence of itself, and only of itself.
+        assert!(
+            yes.contains("`source` is evidence of its own address"),
+            "{yes}"
+        );
+        assert!(yes.contains("that thing's own page"), "{yes}");
         assert_eq!(
             q["criteria"]["false"],
             "No evidence item states this; it may be true in the world but it is not in the evidence."

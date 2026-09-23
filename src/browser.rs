@@ -1156,14 +1156,23 @@ impl Fetcher {
         if !resp.status().is_success() {
             return None;
         }
-        // Only HTML is worth converting; a PDF run through a tag stripper produces
-        // convincing-looking garbage, which is worse than nothing.
         let ct = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        // A PDF gets the same plain-HTTP fast path HTML does, through the PDF
+        // parser rather than the tag stripper (which turns a PDF into
+        // convincing-looking garbage). Before this, a PDF had only obscura's
+        // raw dump, and when that failed the page was lost: lecture-note and
+        // author-hosted copies of the ElGamal paper on drexel.edu, nku.edu and
+        // mit.edu failed there on every attempt, though each is a static file
+        // any GET returns (measured 2026-09-23). The browser path stays as the
+        // fallback for PDFs behind a bot wall, which is what it was built for.
+        if ct.contains("application/pdf") || is_pdf_url(url) {
+            return self.try_http_pdf(url, resp).await;
+        }
         if !ct.contains("text/html") && !ct.contains("application/xhtml") {
             return None;
         }
@@ -1187,7 +1196,56 @@ impl Fetcher {
             rendered: false,
         })
     }
+
+    /// The body of a response already known to be (or to claim to be) a PDF.
+    ///
+    /// Everything that is not a parseable PDF returns `None`, which hands the
+    /// URL to the browser path: an anti-bot challenge served in place of the
+    /// document is HTML, fails the `%PDF` magic, and is exactly the case the
+    /// browser's stealth session exists for.
+    async fn try_http_pdf(&self, url: &str, resp: reqwest::Response) -> Option<PageContent> {
+        // Bound memory before reading: a register's scanned annual report can
+        // run to hundreds of megabytes, and nothing past the first pages of a
+        // document that size is going to be screened anyway.
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_HTTP_PDF_BYTES)
+        {
+            tracing::debug!(url = %url, "pdf over the plain-HTTP size bound; leaving it to the browser");
+            return None;
+        }
+        let final_url = resp.url().to_string();
+        let bytes = resp.bytes().await.ok()?;
+        if bytes.len() as u64 > MAX_HTTP_PDF_BYTES
+            || !bytes[..bytes.len().min(1024)]
+                .windows(4)
+                .any(|w| w == b"%PDF")
+        {
+            return None;
+        }
+        match pdf_text(&bytes) {
+            Ok(text) => {
+                tracing::debug!(url = %url, bytes = bytes.len(), chars = text.len(), "pdf extracted over http");
+                Some(PageContent {
+                    title: pdf_title(&final_url),
+                    url: final_url,
+                    requested_url: url.to_string(),
+                    text,
+                    links: Vec::new(),
+                    rendered: false,
+                })
+            }
+            Err(reason) => {
+                tracing::debug!(url = %url, reason = %reason, "pdf over http could not be read");
+                None
+            }
+        }
+    }
 }
+
+/// The largest PDF the plain-HTTP path will read into memory. Larger ones
+/// fall through to the browser path, which has its own process boundary.
+const MAX_HTTP_PDF_BYTES: u64 = 40 * 1024 * 1024;
 
 /// Convert HTML to readable text.
 ///
@@ -2304,6 +2362,65 @@ mod tests {
             .as_bytes(),
         );
         out
+    }
+
+    /// Serve one HTTP response on 127.0.0.1 and return its URL. Loopback
+    /// only: nothing here touches the network.
+    async fn serve_once(content_type: &'static str, body: Vec<u8>, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}{path}")
+    }
+
+    fn plain_fetcher() -> Fetcher {
+        install_crypto();
+        let jina = Jina::new("k".into(), 1, Duration::from_secs(2)).unwrap();
+        Fetcher::new(Backend::Jina(jina), Duration::from_secs(5)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_static_pdf_is_read_over_plain_http() {
+        let url = serve_once(
+            "application/pdf",
+            minimal_pdf("A Public Key Cryptosystem ElGamal"),
+            "/papers/elgamal.pdf",
+        )
+        .await;
+        let page = plain_fetcher()
+            .try_http(&url)
+            .await
+            .expect("a static PDF must not need the browser");
+        assert!(page.text.contains("ElGamal"), "{:?}", page.text);
+        assert_eq!(page.title, "elgamal.pdf");
+        assert!(!page.rendered);
+    }
+
+    #[tokio::test]
+    async fn a_challenge_page_posing_as_a_pdf_goes_to_the_browser() {
+        // A bot wall answers a .pdf URL with HTML: no %PDF magic, so the
+        // plain path declines and the stealth browser gets its turn.
+        let url = serve_once(
+            "application/pdf",
+            b"<html><body>Checking your browser...</body></html>".to_vec(),
+            "/papers/elgamal.pdf",
+        )
+        .await;
+        assert!(plain_fetcher().try_http(&url).await.is_none());
     }
 
     #[test]
