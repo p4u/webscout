@@ -2268,12 +2268,25 @@ pub(crate) fn guard_fields(request: &str, fields: &[String], entity_field: &str)
             "mail",
             &["email", "emails", "e-mail", "mail", "correo", "correos"],
         ),
+        // "link" is how a request asks for a URL in plain English far more
+        // often than "url" — and its absence here cost a whole run: "provide
+        // the link to the paper" dropped the `url` field before the first
+        // search, so the answer could not carry the one thing it was asked
+        // for, `answered` fell under the floor, and a run that had correctly
+        // established the date reported EMPTY (measured 2026-09-23, ElGamal).
+        // `doi` is the same word in academic dress.
         (
             "website",
             &[
                 "website",
                 "web",
                 "url",
+                "link",
+                "links",
+                "enlace",
+                "enllac",
+                "lien",
+                "doi",
                 "site",
                 "sitio",
                 "homepage",
@@ -2285,13 +2298,15 @@ pub(crate) fn guard_fields(request: &str, fields: &[String], entity_field: &str)
         (
             "url",
             &[
-                "website", "web", "url", "site", "sitio", "homepage", "pagina",
+                "website", "web", "url", "link", "links", "enlace", "enllac", "lien", "doi",
+                "site", "sitio", "homepage", "pagina",
             ],
         ),
         (
             "web",
             &[
-                "website", "web", "url", "site", "sitio", "homepage", "pagina",
+                "website", "web", "url", "link", "links", "enlace", "enllac", "lien", "doi",
+                "site", "sitio", "homepage", "pagina",
             ],
         ),
         (
@@ -6912,6 +6927,29 @@ impl Scout {
         // is the consequence a reader sees; this is the consequence a caller sees.
         if !unsupported_claims.is_empty() && report.outcome == Outcome::Complete {
             report.outcome = Outcome::Partial;
+        }
+
+        // `Empty` is a claim about the EVIDENCE — "nothing verifiable was
+        // found", which the renderer states as "treat this as absence of
+        // evidence". An answer that survived claim verification with at
+        // least one supported sentence is a counter-example to that claim,
+        // and printing the sentence under an EMPTY banner tells the reader
+        // two contradictory things at once. A multi-part question whose
+        // parts are unevenly answered is exactly `Partial`.
+        //
+        // Measured 2026-09-23 (ElGamal): "when was it presented, and link to
+        // the paper" found and verified the 1985 date, missed the link,
+        // scored `answered` 0.34, and reported EMPTY above the correct date.
+        if report.outcome == Outcome::Empty
+            && report.stats.claims_checked > unsupported_claims.len()
+        {
+            report.outcome = Outcome::Partial;
+            report.notes.push(
+                "Part of the question is answered and part is not: the answer below carries \
+                 claims the evidence supports, but the assessment found the request only \
+                 partly met. Read it as incomplete, not as nothing found."
+                    .into(),
+            );
         }
 
         // A second draft that is still stale is kept — it is the better of the two
@@ -14355,6 +14393,42 @@ mod tests {
     }
 
     // F3: guard_fields keyword table.
+    /// "link" is the ordinary English word for a URL, and dropping the field
+    /// it names loses the request's own second half before the first search.
+    /// The ElGamal question asked for a date and a link, kept only the date,
+    /// and reported EMPTY over a correct answer.
+    #[test]
+    fn guard_fields_keeps_a_url_field_the_request_calls_a_link() {
+        let fields: Vec<String> = ["name", "publication_date", "url"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let kept = guard_fields(
+            "Tell me when ElGamal was initially presented as a paper and provide the link to \
+             the paper",
+            &fields,
+            "name",
+        );
+        assert!(kept.contains(&"url".to_string()), "got {kept:?}");
+
+        // The other words a request uses for the same thing.
+        for req in [
+            "the paper and its DOI",
+            "cada entidad con su enlace",
+            "chaque article avec le lien",
+            "with links to each source",
+        ] {
+            let kept = guard_fields(req, &fields, "name");
+            assert!(kept.contains(&"url".to_string()), "{req} -> {kept:?}");
+        }
+
+        // A request that mentions no URL at all still drops it: the guard
+        // exists to stop the classifier inventing fields nobody asked for.
+        let kept = guard_fields("when was ElGamal first published", &fields, "name");
+        assert!(!kept.contains(&"url".to_string()), "got {kept:?}");
+    }
+
     //
     // Decidim listing request: the classifier proposed name/type/location/
     // website; none of type/location/website are mentioned. Only "name"
