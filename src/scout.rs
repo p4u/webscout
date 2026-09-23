@@ -21,7 +21,7 @@
 //! producing, which is exactly the run you wanted to finish.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
@@ -362,6 +362,35 @@ fn count_enrichable(
     attempts: &HashMap<(String, String), u8>,
     templates: &HashMap<String, EnrichTemplates>,
 ) -> usize {
+    count_pairs_below(mission, store, attempts, templates, 2)
+}
+
+/// Enrichable pairs that have never been attempted at all.
+///
+/// The plateau guard reads this: "more rounds would change the result only
+/// marginally" cannot be known about work never tried once. q62 stopped at
+/// round 4 on a 0.72 plateau with 454 municipalities found and 3 providers
+/// identified — nearly every provider pair still untouched — where 40 rounds
+/// had identified 49 (measured 2026-09-24). Jev sees counts; this is the
+/// fact the counts hide.
+fn count_untried(
+    mission: &Mission,
+    store: &BTreeMap<String, Record>,
+    attempts: &HashMap<(String, String), u8>,
+    templates: &HashMap<String, EnrichTemplates>,
+) -> usize {
+    count_pairs_below(mission, store, attempts, templates, 1)
+}
+
+/// Unfilled, workable (entity, field) pairs with fewer than `cap` attempts.
+/// `cap` 2 is enrich_round's own eligibility rule; `cap` 1 is "never tried".
+fn count_pairs_below(
+    mission: &Mission,
+    store: &BTreeMap<String, Record>,
+    attempts: &HashMap<(String, String), u8>,
+    templates: &HashMap<String, EnrichTemplates>,
+    cap: u8,
+) -> usize {
     store
         .iter()
         .filter(|(_, rec)| {
@@ -380,7 +409,7 @@ fn count_enrichable(
                             .get(&(key.clone(), (*f).clone()))
                             .copied()
                             .unwrap_or(0)
-                            < 2
+                            < cap
                         // A referential determination is only workable while
                         // its referent is (or can still become) known: an
                         // empty, attempt-capped referent would strand the
@@ -396,7 +425,7 @@ fn count_enrichable(
                                         .get(&(key.clone(), sf.clone()))
                                         .copied()
                                         .unwrap_or(0)
-                                        < 2
+                                        < cap
                             }
                             _ => true,
                         }
@@ -1490,7 +1519,85 @@ struct Steer {
     satisfied: f64,
     exhausted: f64,
     bottleneck: String,
+    /// Has progress levelled off? Acted on only under `auto_rounds`; see
+    /// `plateau_stop`.
+    plateaued: f64,
 }
+
+/// What one harvest round left behind, for the trajectory steer is shown.
+///
+/// Steer used to see only `gained_this_round`, which cannot tell "still
+/// growing" from "flattened out": one round's gain of 3 means opposite things
+/// after rounds of 40 and after rounds of 2. `filled` is counted so that
+/// enrichment progress reads as progress — a round that fills forty fields and
+/// finds no new entity is not a stalled round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct RoundSnapshot {
+    round: usize,
+    found: usize,
+    complete: usize,
+    filled: usize,
+    /// A search batch was lost to its deadline during this round: the round's
+    /// "nothing new" says nothing about the web. See `plateau_stop`.
+    starved: bool,
+    /// Enrichable pairs never attempted, as of this round (`count_untried`).
+    untried: usize,
+}
+
+/// Non-empty values across every record, the subject field aside.
+fn filled_values(store: &BTreeMap<String, Record>, mission: &Mission) -> usize {
+    let entity = mission.entity_field.as_str();
+    store
+        .values()
+        .map(|r| {
+            r.fields
+                .iter()
+                .filter(|(k, v)| k.as_str() != entity && !v.trim().is_empty())
+                .count()
+        })
+        .sum()
+}
+
+/// Rounds a harvest always gets before a plateau verdict may end it: a
+/// trajectory of one or two points is not a trajectory.
+const AUTO_MIN_ROUNDS: usize = 4;
+
+/// Does a plateau verdict end this harvest?
+///
+/// Only under `auto_rounds`, only once there is a trajectory to read, and not
+/// subject to `steer_stop_overridden`: that override exists because
+/// `satisfied` was blind to unfilled fields, but the plateau question is shown
+/// fill progress directly — and on an open-ended list the override never
+/// clears, which is the very thing this verdict exists to end.
+///
+/// Never on a starved trajectory. A flat line is only evidence of a plateau
+/// if the rounds behind it actually searched: q81's enrichment batches were
+/// lost to the lane deadline in rounds 3 and 4, Jev read the flat history
+/// correctly as 0.93 plateaued, and the run stopped with 62 companies and not
+/// one classified (measured 2026-09-24). Jev judges the curve; code decides
+/// whether the curve is a measurement of the web or of our own failure.
+fn plateau_stop(
+    auto_rounds: bool,
+    round: usize,
+    plateaued: f64,
+    history: &[RoundSnapshot],
+) -> bool {
+    let clean = history
+        .iter()
+        .rev()
+        .take(PLATEAU_CLEAN_WINDOW)
+        .all(|h| !h.starved);
+    // Every workable pair has had at least one try. A plateau is a claim that
+    // more effort yields little, and effort not yet spent says nothing either
+    // way (q62: 454 found, 3 providers, stopped at round 4).
+    let all_tried = history.last().is_some_and(|h| h.untried == 0);
+    auto_rounds && round >= AUTO_MIN_ROUNDS && plateaued >= 0.7 && clean && all_tried
+}
+
+/// Recent rounds that must all have searched successfully before a plateau
+/// may end a run: a plateau is read over several rounds, so one starved
+/// round inside the window is enough to fake one.
+const PLATEAU_CLEAN_WINDOW: usize = 3;
 
 /// Fold a string for accent/case-insensitive substring matching. Cheap
 /// approximation of `types::normalize_entity` without the municipal-prefix
@@ -2581,6 +2688,26 @@ fn answer_part_question(field: &str) -> Value {
         )
     }
 }
+
+/// Rounds an answer mission may use.
+///
+/// Under `auto`, a short cap: an answer stops on its own verdicts (every part
+/// answered, barren rounds, no new queries) long before it, and the cap only
+/// bounds a question that keeps turning up loosely related pages. A number the
+/// caller chose is honoured exactly. It used to be silently clamped to 6, so a
+/// UI set to 40 rounds read as a setting that did nothing (reported
+/// 2026-09-23).
+pub(crate) fn answer_round_ceiling(max_rounds: usize, auto: bool) -> usize {
+    if auto {
+        max_rounds.min(ANSWER_AUTO_ROUNDS)
+    } else {
+        max_rounds
+    }
+}
+
+/// The answer path's own cap under `auto`. Six is the old silent clamp; every
+/// measured ElGamal run finished inside four.
+pub(crate) const ANSWER_AUTO_ROUNDS: usize = 6;
 
 /// What the writer is told about parts the judge found unanswered.
 ///
@@ -4154,6 +4281,13 @@ impl Scout {
         let mut quarantined: HashSet<String> = HashSet::new();
         let mut barren_rounds = 0usize;
         let mut barren_no_hits = 0usize;
+        // Per-round trajectory for the plateau verdict; see `RoundSnapshot`.
+        let mut history: Vec<RoundSnapshot> = Vec::new();
+        let mut stopped_on_plateau = false;
+        // Lane failures as of the previous snapshot; a rise marks the round
+        // starved. Rounds are pipelined, so a failure can land a round early
+        // or late — which is why `plateau_stop` checks a window, not a round.
+        let mut lane_failures_seen = self.fetcher.lane_failures();
         // Pages already read. Without this the same directory is refetched every
         // round, spending the entire budget re-extracting records we already have.
         let mut seen_urls: HashSet<String> = HashSet::new();
@@ -4916,6 +5050,16 @@ impl Scout {
             // adjustments are the ones made while progress is still happening: a run
             // that is finding two items a round needs widening now, not after it has
             // stalled three times.
+            let lane_failures_now = self.fetcher.lane_failures();
+            history.push(RoundSnapshot {
+                round,
+                found: store.len(),
+                complete: complete_now,
+                filled: filled_values(&store, mission),
+                starved: lane_failures_now > lane_failures_seen,
+                untried: count_untried(mission, &store, &enrich_attempts, enrich_templates),
+            });
+            lane_failures_seen = lane_failures_now;
             if self.auto {
                 let summary = self.summarize_records(mission, &store);
                 // Package B2.5: Jev decides satisfied/exhausted/bottleneck.
@@ -4924,13 +5068,14 @@ impl Scout {
                 let steer = self
                     .timed(
                         "9b steer (Jev)",
-                        self.steer(mission, round, &store, gained, barren_rounds),
+                        self.steer(mission, round, &store, gained, barren_rounds, &history),
                     )
                     .await;
                 if let Some(s) = steer {
                     tracing::info!(
                         satisfied = s.satisfied,
                         exhausted = s.exhausted,
+                        plateaued = s.plateaued,
                         bottleneck = %s.bottleneck,
                         "auto steer"
                     );
@@ -4967,6 +5112,17 @@ impl Scout {
                         if let Ok(mut t) = self.tune.write() {
                             t.enrich_batch = (t.enrich_batch * 2).min(60);
                         }
+                    }
+                    if plateau_stop(self.t().auto_rounds, round, s.plateaued, &history) {
+                        tracing::info!(
+                            round,
+                            plateaued = s.plateaued,
+                            found = store.len(),
+                            complete = complete_now,
+                            "auto rounds: progress levelled off; stopping"
+                        );
+                        stopped_on_plateau = true;
+                        break;
                     }
                     // G3: code decides the bottleneck from counts. Jev's
                     // `bottleneck` is kept in report.notes above as an opinion
@@ -5217,6 +5373,14 @@ impl Scout {
             Outcome::Partial
         };
 
+        if stopped_on_plateau && report.outcome != Outcome::Complete {
+            report.notes.push(format!(
+                "Stopped automatically after {} round(s): progress had levelled off. Re-run \
+                 with a fixed --max-rounds (in the UI, a number instead of auto) to keep \
+                 searching past the plateau.",
+                report.stats.rounds
+            ));
+        }
         if report.outcome == Outcome::Truncated {
             report.notes.push(format!(
                 "Stopped at the {}-round ceiling while still finding new records. \
@@ -6621,7 +6785,7 @@ impl Scout {
         // planner is told to aim at them (see `answer_parts`).
         let mut missing: Vec<String> = Vec::new();
 
-        for round in 1..=self.t().max_rounds.min(6) {
+        for round in 1..=answer_round_ceiling(self.t().max_rounds, self.t().auto_rounds) {
             report.stats.rounds = round;
             let before = evidence.len();
 
@@ -8184,6 +8348,7 @@ impl Scout {
         store: &BTreeMap<String, Record>,
         gained: usize,
         barren_rounds: usize,
+        history: &[RoundSnapshot],
     ) -> Option<Steer> {
         // Compact state: totals, small histograms, up to 8 sample rows.
         let found_entities = store.len();
@@ -8236,6 +8401,10 @@ impl Scout {
             "found_complete": found_complete,
             "gained_this_round": gained,
             "barren_rounds": barren_rounds,
+            // The last few rounds, oldest first: what the plateau question
+            // reads. Eight is enough to see a curve bend and keeps the state
+            // small on a 100-round run.
+            "history": &history[history.len().saturating_sub(8)..],
             "field_fill": field_fill,
             "top_domains": top_domains,
             "sample": sample,
@@ -8256,6 +8425,18 @@ impl Scout {
                     "Is the accessible web plausibly exhausted for this request — same domains, no new records for several rounds?",
                     "Yes — repeated rounds, no new material, sources circling back.",
                     "No — there are angles or sources that have not been tried.",
+                ),
+            ),
+            (
+                "plateaued".to_string(),
+                noul(
+                    "Has progress levelled off? `history` lists, per round, the records found, \
+                     how many are complete, and how many field values are filled.",
+                    "Yes — the last few rounds added little to records, completeness or filled \
+                     fields compared with what is already found; more rounds would change the \
+                     result only marginally.",
+                    "No — recent rounds are still adding records, completing them, or filling \
+                     fields at a rate that would materially change the result.",
                 ),
             ),
             (
@@ -8290,6 +8471,9 @@ impl Scout {
                 satisfied: a.noul("satisfied"),
                 exhausted: a.noul("exhausted"),
                 bottleneck: a.choice("bottleneck"),
+                // A failed plateau ask reads 0.0 — "still progressing" — so a
+                // broken guard never ends a run early.
+                plateaued: a.noul_or("plateaued", 0.0),
             }),
             Err(e) => {
                 tracing::debug!(error = %e, "steer failed; falling back to LLM direct");
@@ -12935,6 +13119,41 @@ mod tests {
         assert_eq!(count_enrichable(&m, &store, &attempts, &templates), 0);
     }
 
+    /// "Never tried" is the same rule as enrichable with a cap of one: a pair
+    /// tried once is still enrichable, but no longer untried — and the plateau
+    /// guard may only fire once untried reaches zero.
+    #[test]
+    fn count_untried_drops_a_pair_after_its_first_attempt() {
+        use std::collections::{BTreeMap, HashMap};
+        let m = Mission {
+            entity_field: "name".into(),
+            fields: vec!["name".into(), "email".into(), "website".into()],
+            ..Default::default()
+        };
+        let mut fields = BTreeMap::new();
+        fields.insert("name".to_string(), "Acme".to_string());
+        let mut store = BTreeMap::new();
+        store.insert(
+            "acme".to_string(),
+            Record {
+                fields,
+                ..Default::default()
+            },
+        );
+        let none = HashMap::new();
+        let t = HashMap::new();
+        assert_eq!(count_untried(&m, &store, &none, &t), 2);
+
+        let mut once = HashMap::new();
+        once.insert(("acme".to_string(), "email".to_string()), 1u8);
+        assert_eq!(count_untried(&m, &store, &once, &t), 1, "email was tried");
+        assert_eq!(
+            count_enrichable(&m, &store, &once, &t),
+            2,
+            "but may be tried again"
+        );
+    }
+
     /// `count_enrichable` mirrors `enrich_round`'s three eligibility rules:
     /// non-empty entity value, missing non-entity field, fewer than two
     /// burned attempts. It is what keeps a dry planner from ending a harvest
@@ -14661,6 +14880,107 @@ mod tests {
         assert_eq!(answered_across_parts(0.73, &[]), 0.73);
         let single = mission_with("Vodafone CEO", &[], &["name"]);
         assert!(answer_parts(&single).is_empty());
+    }
+
+    /// A plateau ends a harvest only under auto, only with a trajectory to
+    /// read, and only on a decisive verdict — never when the caller named a
+    /// number, and never because the ask failed (which reads 0.0).
+    #[test]
+    fn a_plateau_stops_an_auto_harvest_and_nothing_else() {
+        let snap = |round, starved| RoundSnapshot {
+            round,
+            found: 62,
+            complete: 0,
+            filled: 0,
+            starved,
+            untried: 0,
+        };
+        let clean: Vec<RoundSnapshot> = (1..=4).map(|r| snap(r, false)).collect();
+        assert!(plateau_stop(true, AUTO_MIN_ROUNDS, 0.8, &clean));
+        assert!(
+            !plateau_stop(false, 30, 0.95, &clean),
+            "a fixed ceiling is honoured"
+        );
+        assert!(
+            !plateau_stop(true, AUTO_MIN_ROUNDS - 1, 0.95, &clean),
+            "too early to read a curve"
+        );
+        assert!(!plateau_stop(true, 10, 0.55, &clean), "not decisive");
+        assert!(
+            !plateau_stop(true, 10, 0.0, &clean),
+            "a failed ask is not a plateau"
+        );
+
+        // q81, 2026-09-24: rounds 3 and 4 lost their searches to the lane
+        // deadline. The flat line is our failure, not the web's.
+        let starved = vec![snap(1, false), snap(2, false), snap(3, true), snap(4, true)];
+        assert!(!plateau_stop(true, 4, 0.93, &starved));
+        // One starved round anywhere in the window is enough to veto...
+        let one = vec![
+            snap(1, false),
+            snap(2, true),
+            snap(3, false),
+            snap(4, false),
+        ];
+        assert!(!plateau_stop(true, 4, 0.93, &one));
+        // ...but a failure that has aged out of the window no longer does.
+        let aged = vec![
+            snap(1, true),
+            snap(2, false),
+            snap(3, false),
+            snap(4, false),
+        ];
+        assert!(plateau_stop(true, 4, 0.93, &aged));
+
+        // q62, 2026-09-24: 454 found, nearly every provider pair never tried.
+        // A plateau cannot be read off effort that was never spent.
+        let mut untouched = clean.clone();
+        untouched.last_mut().unwrap().untried = 880;
+        assert!(!plateau_stop(true, 4, 0.72, &untouched));
+        // No history at all is not a trajectory either.
+        assert!(!plateau_stop(true, 4, 0.95, &[]));
+    }
+
+    /// Under auto an answer keeps its short cap; a chosen number is honoured
+    /// exactly — it used to be clamped to 6 without a word.
+    #[test]
+    fn an_answer_honours_a_chosen_round_count() {
+        assert_eq!(answer_round_ceiling(40, true), ANSWER_AUTO_ROUNDS);
+        assert_eq!(
+            answer_round_ceiling(3, true),
+            3,
+            "a quick preset stays quick"
+        );
+        assert_eq!(answer_round_ceiling(40, false), 40);
+        assert_eq!(answer_round_ceiling(2, false), 2);
+    }
+
+    /// Fill progress is progress: the trajectory counts filled values, the
+    /// subject field aside, so an enrichment round does not read as stalled.
+    #[test]
+    fn filled_values_counts_every_value_but_the_name() {
+        let m = mission_with("coworking spaces", &[], &["name", "email", "website"]);
+        let mut store = BTreeMap::new();
+        let rec = |pairs: &[(&str, &str)]| Record {
+            fields: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        store.insert(
+            "a".into(),
+            rec(&[("name", "A"), ("email", "a@x.org"), ("website", "")]),
+        );
+        store.insert(
+            "b".into(),
+            rec(&[
+                ("name", "B"),
+                ("email", "b@x.org"),
+                ("website", "https://b.org"),
+            ]),
+        );
+        assert_eq!(filled_values(&store, &m), 3);
     }
 
     /// The writer hears about a part the judge found missing, by name, and is

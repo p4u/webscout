@@ -111,9 +111,22 @@ function typeOf(option) {
   return Array.isArray(option.values) ? 'enum' : 'string';
 }
 
+/** The option also accepts "auto" — let the run decide — and says so in its schema. */
+function acceptsAuto(option) {
+  return option.auto === true;
+}
+
+const AUTO = 'auto';
+
 function normalise(option, raw) {
   const type = typeOf(option);
   if (type === 'boolean') return Boolean(raw);
+  // An empty field on an auto-capable option means auto, not "the default":
+  // clearing the number is how a person hands the decision back to the run.
+  if (acceptsAuto(option)) {
+    if (raw === '' || raw === null || raw === undefined) return AUTO;
+    if (String(raw).trim().toLowerCase() === AUTO) return AUTO;
+  }
   if (type === 'integer' || type === 'number') {
     if (raw === '' || raw === null || raw === undefined) return option.default ?? null;
     const n = type === 'integer' ? Math.round(Number(raw)) : Number(raw);
@@ -137,6 +150,8 @@ function sameValue(a, b) {
 
 function writeToInput(input, option, value) {
   if (typeOf(option) === 'boolean') input.checked = Boolean(value);
+  // A number input cannot hold the word "auto"; auto shows as the placeholder.
+  else if (value === AUTO) input.value = '';
   else input.value = value === null || value === undefined ? '' : String(value);
 }
 
@@ -203,7 +218,8 @@ function buildChip(option, value, onInput) {
     } else {
       input.type = 'text';
     }
-    input.value = value === null || value === undefined ? '' : String(value);
+    if (acceptsAuto(option)) input.placeholder = AUTO;
+    writeToInput(input, option, value);
     input.addEventListener('change', () => {
       onInput(input.value);
       writeToInput(input, option, normalise(option, input.value));
@@ -280,7 +296,8 @@ function buildField(option, value, onInput) {
     } else {
       input.type = 'text';
     }
-    input.value = value === null || value === undefined ? '' : String(value);
+    if (acceptsAuto(option)) input.placeholder = AUTO;
+    writeToInput(input, option, value);
     input.addEventListener('change', () => {
       onInput(input.value);
       writeToInput(input, option, normalise(option, input.value));
@@ -305,6 +322,9 @@ function boundsText(option) {
   if (type !== 'integer' && type !== 'number') return '';
   const hasMin = typeof option.min === 'number';
   const hasMax = typeof option.max === 'number';
+  if (hasMin && hasMax && acceptsAuto(option)) {
+    return `(${option.min}–${option.max}, or empty for auto)`;
+  }
   if (hasMin && hasMax) return `(${option.min}–${option.max})`;
   if (hasMin) return `(min ${option.min})`;
   if (hasMax) return `(max ${option.max})`;

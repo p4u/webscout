@@ -306,6 +306,12 @@ pub struct OptionSpec {
     pub max: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<&'static str>>,
+    /// The option also accepts the string `"auto"`, meaning "let the run
+    /// decide". A generic flag rather than a special case so the UI, which
+    /// renders every control from this schema, needs no knowledge of which
+    /// option it is: an empty field means auto.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
     /// One line, always present. An option a person cannot understand from the
     /// form is an option they will set wrongly.
     pub help: &'static str,
@@ -335,6 +341,7 @@ fn int_opt(
         min: Some(json!(min)),
         max: Some(json!(max)),
         values: None,
+        auto: false,
         help,
     }
 }
@@ -355,6 +362,7 @@ fn num_opt(
         min: Some(json!(min)),
         max: Some(json!(max)),
         values: None,
+        auto: false,
         help,
     }
 }
@@ -373,6 +381,7 @@ fn bool_opt(
         min: None,
         max: None,
         values: None,
+        auto: false,
         help,
     }
 }
@@ -392,6 +401,7 @@ fn enum_opt(
         min: None,
         max: None,
         values: Some(values.to_vec()),
+        auto: false,
         help,
     }
 }
@@ -408,6 +418,7 @@ fn string_opt(name: &'static str, label: &'static str, help: &'static str) -> Op
         min: None,
         max: None,
         values: None,
+        auto: false,
         help,
     }
 }
@@ -441,14 +452,18 @@ pub fn catalogue() -> Vec<OptionGroup> {
                     &PRESETS,
                     "Starting point for every other setting: quick looks, standard digs, thorough leaves no stone unturned.",
                 ),
-                int_opt(
-                    "max_rounds",
-                    "Max rounds",
-                    d.max_rounds,
-                    1,
-                    200,
-                    "Hard ceiling on research rounds. There is no time limit; this is what bounds the work.",
-                ),
+                OptionSpec {
+                    auto: true,
+                    default: json!("auto"),
+                    ..int_opt(
+                        "max_rounds",
+                        "Max rounds",
+                        d.max_rounds,
+                        1,
+                        200,
+                        "Leave on auto to let the run stop when it has what it needs or progress levels off, or set a number to cap the rounds exactly. There is no time limit either way.",
+                    )
+                },
                 enum_opt(
                     "format",
                     "Format",
@@ -887,7 +902,17 @@ impl RunOptions {
                         format!("option \"planner_thinking_control\" has no such mode: \"{s}\"")
                     })?);
                 }
-                "max_rounds" => out.tune.max_rounds = want_u64(spec, v)? as usize,
+                "max_rounds" => {
+                    // "auto" keeps the preset's ceiling as the safety net and
+                    // lets the run decide; a number is a ceiling honoured
+                    // exactly, with no plateau stop.
+                    if v.as_str().is_some_and(|t| t.eq_ignore_ascii_case("auto")) {
+                        out.tune.auto_rounds = true;
+                    } else {
+                        out.tune.max_rounds = want_u64(spec, v)? as usize;
+                        out.tune.auto_rounds = false;
+                    }
+                }
                 "max_barren_rounds" => out.tune.max_barren_rounds = want_u64(spec, v)? as usize,
                 "queries_per_round" => out.tune.queries_per_round = want_u64(spec, v)? as usize,
                 "results_per_query" => out.tune.results_per_query = want_u64(spec, v)? as usize,
@@ -1739,6 +1764,12 @@ mod tests {
                 }
                 let min = opt.min.as_ref().and_then(Value::as_f64).expect(opt.name);
                 let max = opt.max.as_ref().and_then(Value::as_f64).expect(opt.name);
+                assert!(min <= max, "{} has min above max", opt.name);
+                // An auto-capable option may default to "auto"; the range
+                // still governs every number a caller can send it.
+                if opt.auto && opt.default == json!("auto") {
+                    continue;
+                }
                 let default = opt.default.as_f64().expect(opt.name);
                 assert!(min <= max, "{} has min above max", opt.name);
                 assert!(
@@ -1750,11 +1781,51 @@ mod tests {
         }
     }
 
+    /// `max_rounds` takes "auto" or a number; a number turns auto off, so a
+    /// ceiling the caller chose is honoured exactly and never cut short by a
+    /// plateau verdict.
+    #[test]
+    fn max_rounds_accepts_auto_or_a_number() {
+        let o = RunOptions::from_map(&opts(&[("max_rounds", json!("auto"))])).unwrap();
+        assert!(o.tune.auto_rounds);
+        assert_eq!(
+            o.tune.max_rounds,
+            Tunables::default().max_rounds,
+            "safety net kept"
+        );
+
+        let o = RunOptions::from_map(&opts(&[("max_rounds", json!(12))])).unwrap();
+        assert!(!o.tune.auto_rounds);
+        assert_eq!(o.tune.max_rounds, 12);
+
+        // Omitted: the default, which is auto.
+        let o = RunOptions::from_map(&opts(&[])).unwrap();
+        assert!(o.tune.auto_rounds);
+
+        // Other strings are still type errors, not a quiet auto.
+        assert!(RunOptions::from_map(&opts(&[("max_rounds", json!("lots"))])).is_err());
+    }
+
+    /// Only options that can mean "let the run decide" say so in the schema.
+    #[test]
+    fn only_max_rounds_is_auto_capable() {
+        let auto: Vec<&str> = catalogue()
+            .into_iter()
+            .flat_map(|g| g.options)
+            .filter(|o| o.auto)
+            .map(|o| o.name)
+            .collect();
+        assert_eq!(auto, vec!["max_rounds"]);
+    }
+
     #[test]
     fn defaults_are_read_from_tunables_not_copied() {
         let index = spec_index();
         let d = Tunables::default();
-        assert_eq!(index["max_rounds"].default, json!(d.max_rounds));
+        // max_rounds defaults to auto, and auto is what Tunables defaults to.
+        assert!(d.auto_rounds);
+        assert!(index["max_rounds"].auto);
+        assert_eq!(index["max_rounds"].default, json!("auto"));
         assert_eq!(index["grounding_floor"].default, json!(d.grounding_floor));
         assert_eq!(index["enrich_batch"].default, json!(d.enrich_batch));
         assert_eq!(

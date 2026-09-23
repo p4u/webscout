@@ -436,7 +436,7 @@ function showResult(event) {
 const OUTCOME_HELP = {
   complete: 'The run satisfied the request.',
   partial: 'The web ran out before the target did, or some claims were unsupported.',
-  truncated: 'The round ceiling hit while results were still arriving. Raise max_rounds for more.',
+  truncated: 'The round ceiling hit while results were still arriving. Set a higher max rounds for more.',
   empty: 'Nothing verifiable was found. This is a result, not a failure.',
 };
 

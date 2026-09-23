@@ -109,9 +109,15 @@ struct Cli {
     #[arg(long, conflicts_with = "thorough")]
     quick: bool,
 
-    /// Maximum search rounds. There is no time limit; this bounds the work.
-    #[arg(long)]
-    max_rounds: Option<usize>,
+    /// Maximum search rounds, or `auto` (the default) to let the run decide.
+    ///
+    /// `auto` stops the run when it has what it came for or when progress
+    /// levels off, with the preset's ceiling kept only as a safety net. A
+    /// number is a hard ceiling honoured exactly; the run still stops early
+    /// when it is done, but never for diminishing returns. There is no time
+    /// limit either way.
+    #[arg(long, value_name = "N|auto", value_parser = parse_round_limit)]
+    max_rounds: Option<RoundLimit>,
 
     /// Stop after this many consecutive rounds that find nothing new.
     #[arg(long)]
@@ -386,6 +392,28 @@ fn main() -> Result<()> {
     std::process::exit(code);
 }
 
+/// What `--max-rounds` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundLimit {
+    Auto,
+    Fixed(usize),
+}
+
+/// `auto`, or a whole number of rounds of at least one. Zero is rejected
+/// rather than read as "no limit": the way to ask for no fixed limit is
+/// `auto`, which still keeps a safety ceiling.
+fn parse_round_limit(raw: &str) -> Result<RoundLimit, String> {
+    let t = raw.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Ok(RoundLimit::Auto);
+    }
+    match t.parse::<usize>() {
+        Ok(0) => Err("must be at least 1, or `auto`".into()),
+        Ok(n) => Ok(RoundLimit::Fixed(n)),
+        Err(_) => Err(format!("`{t}` is not a number of rounds or `auto`")),
+    }
+}
+
 /// Reject the two argument shapes that cannot mean anything.
 ///
 /// Split out from `run` so the rule is testable without a runtime: a mode switch
@@ -415,8 +443,13 @@ async fn run(cli: Cli) -> Result<i32> {
         Tunables::default()
     };
 
-    if let Some(v) = cli.max_rounds {
-        tune.max_rounds = v;
+    match cli.max_rounds {
+        Some(RoundLimit::Fixed(v)) => {
+            tune.max_rounds = v;
+            tune.auto_rounds = false;
+        }
+        // `auto` keeps the preset's ceiling as the safety net.
+        Some(RoundLimit::Auto) | None => tune.auto_rounds = true,
     }
     if let Some(v) = cli.max_barren_rounds {
         tune.max_barren_rounds = v;
@@ -929,9 +962,22 @@ fn init_logging(cli: &Cli) {
 #[cfg(test)]
 mod main_tests {
     use super::{
-        check_query_args, commas, component_of, default_log_level, llm_extras, run_summary,
-        total_cost_usd,
+        RoundLimit, check_query_args, commas, component_of, default_log_level, llm_extras,
+        parse_round_limit, run_summary, total_cost_usd,
     };
+
+    #[test]
+    fn max_rounds_takes_a_number_or_auto() {
+        assert_eq!(parse_round_limit("auto"), Ok(RoundLimit::Auto));
+        assert_eq!(parse_round_limit(" AUTO "), Ok(RoundLimit::Auto));
+        assert_eq!(parse_round_limit("40"), Ok(RoundLimit::Fixed(40)));
+        assert!(
+            parse_round_limit("0").is_err(),
+            "zero is not a way to say auto"
+        );
+        assert!(parse_round_limit("lots").is_err());
+        assert!(parse_round_limit("-3").is_err());
+    }
 
     #[test]
     fn api_mode_is_not_silent_by_default() {

@@ -861,6 +861,14 @@ impl SearchLane {
         }
     }
 
+    /// How many of this lane's queries run at once.
+    fn concurrency(&self) -> usize {
+        match &self.engine {
+            LaneEngine::Ddg(o) => o.concurrency,
+            LaneEngine::Jina(j) => j.concurrency,
+        }
+    }
+
     /// Run every query on this lane, tagging each hit with the lane id.
     pub async fn search(&self, queries: &[String], limit: usize) -> Vec<(String, Vec<Hit>)> {
         let mut out = match &self.engine {
@@ -876,6 +884,24 @@ impl SearchLane {
         }
         out
     }
+}
+
+/// A lane's deadline for one batch: the per-wave deadline times the number
+/// of waves the batch needs.
+///
+/// The deadline was fixed at 20 seconds — measured as three times the p50 of
+/// a five-query batch — and applied unchanged to enrichment batches of 25
+/// and 50 queries. With two harvests sharing DuckDuckGo, both batch sizes ran
+/// out of time and every query in them came back empty, which the next steer
+/// read as a stalled run (measured 2026-09-24: q81 enrichment rounds 3 and 4
+/// lost whole, the run stopped at round 4 with 62 companies and none
+/// classified; the same batch sizes cleared the fixed deadline alone that
+/// afternoon). `Obscura::scrape` already scales its own budget by waves; the
+/// lane deadline now does the same, so a lane still costs only its own
+/// results when it hangs.
+pub fn lane_budget(per_wave: Duration, queries: usize, concurrency: usize) -> Duration {
+    let waves = queries.div_ceil(concurrency.max(1)).max(1) as u32;
+    per_wave * waves
 }
 
 /// Which backend does the fetching.
@@ -939,6 +965,12 @@ pub struct Fetcher {
     pub lanes: Vec<SearchLane>,
     /// On-disk cache of lane responses. `None` disables caching entirely.
     pub search_cache: Option<crate::search_cache::SearchCache>,
+    /// Lane batches lost to their deadline, over the life of the fetcher.
+    ///
+    /// Read by the harvest loop to tell a round the web had nothing for from
+    /// a round our search layer failed: both look like "nothing new", and only
+    /// the first is evidence that the run has levelled off.
+    lane_failures: std::sync::atomic::AtomicUsize,
 }
 
 impl Fetcher {
@@ -947,6 +979,7 @@ impl Fetcher {
         Ok(Self {
             lanes,
             search_cache: None,
+            lane_failures: std::sync::atomic::AtomicUsize::new(0),
             http: reqwest::Client::builder()
                 .timeout(timeout)
                 // Sites serve very different markup to something that looks like a
@@ -1045,7 +1078,8 @@ impl Fetcher {
 
         let mut fresh: HashMap<String, Vec<Hit>> = HashMap::new();
         if !missing.is_empty() {
-            match tokio::time::timeout(lane.deadline, lane.search(&missing, limit)).await {
+            let budget = lane_budget(lane.deadline, missing.len(), lane.concurrency());
+            match tokio::time::timeout(budget, lane.search(&missing, limit)).await {
                 Ok(results) => {
                     for (q, hits) in results {
                         if let Some(cache) = &self.search_cache {
@@ -1058,10 +1092,12 @@ impl Fetcher {
                     }
                 }
                 Err(_) => {
+                    self.lane_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         lane = lane.id,
                         queries = missing.len(),
-                        deadline_s = lane.deadline.as_secs(),
+                        deadline_s = budget.as_secs(),
                         "search lane exceeded its deadline; continuing with the other lanes"
                     );
                 }
@@ -1079,6 +1115,13 @@ impl Fetcher {
                 (q.clone(), hits)
             })
             .collect()
+    }
+
+    /// Lane batches lost to their deadline so far. Monotonic; callers diff it
+    /// across a round to learn whether that round's searches were starved.
+    pub fn lane_failures(&self) -> usize {
+        self.lane_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The end-of-run cache line. Called by `main` once the scout is done.
@@ -2810,6 +2853,21 @@ mod tests {
         let out = fetcher.search_many(&["q".to_string()], 3).await;
         assert_eq!(out.len(), 1);
         assert!(out[0].1.is_empty());
+    }
+
+    /// A batch gets one deadline per wave it needs, never less than one.
+    #[test]
+    fn lane_budget_scales_with_the_waves_a_batch_needs() {
+        let d = Duration::from_secs(20);
+        assert_eq!(lane_budget(d, 5, 12), d, "a normal round: one wave");
+        assert_eq!(lane_budget(d, 25, 12), d * 3, "q81's enrichment batch");
+        assert_eq!(lane_budget(d, 50, 12), d * 5);
+        assert_eq!(lane_budget(d, 0, 12), d, "never zero");
+        assert_eq!(
+            lane_budget(d, 3, 0),
+            d * 3,
+            "a zero concurrency reads as one"
+        );
     }
 
     #[test]

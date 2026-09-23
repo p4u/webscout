@@ -347,7 +347,23 @@ pub struct Tunables {
     // came for, or when it stops making progress — not when a timer fires, since a
     // timer would truncate a run that was still producing.
     /// Hard ceiling on rounds, so a pathological run cannot spin forever.
+    ///
+    /// Under `auto_rounds` this is only a safety net — the preset's ceiling —
+    /// and the run is expected to stop on a judged verdict well before it.
+    /// A number the caller chose is honoured exactly, on both paths.
     pub max_rounds: usize,
+    /// Let the run decide when to stop instead of running to `max_rounds`.
+    ///
+    /// On by default. A harvest then also stops when Jev judges progress has
+    /// levelled off (`plateaued`, read from a per-round history), which the
+    /// existing verdicts could not see: steer was shown one round's gain, and
+    /// its satisfied/exhausted stops are overridden while any record has an
+    /// enrichable field — on an open-ended list new half-filled records keep
+    /// that condition true forever, so only the ceiling ended the run
+    /// (measured 2026-09-23, q62: 40 of 40 rounds on every rerun). An answer
+    /// keeps its own short cap. A caller who names a number opts out: they
+    /// asked for depth, and a plateau stop would second-guess them.
+    pub auto_rounds: bool,
     /// Consecutive rounds yielding zero new verified items before giving up.
     pub max_barren_rounds: usize,
 
@@ -546,6 +562,8 @@ impl Default for Tunables {
             read_per_query: 3,
 
             max_rounds: 40,
+
+            auto_rounds: true,
             max_barren_rounds: 3,
 
             keep_relevance: 0.35,
@@ -601,6 +619,7 @@ impl Tunables {
             results_per_query: 20,
             read_per_query: 8,
             max_rounds: 100,
+            auto_rounds: true,
             max_barren_rounds: 5,
             max_chunks_per_page: 20,
             harvest_max_chunks_per_page: 80,
@@ -616,6 +635,7 @@ impl Tunables {
             results_per_query: 6,
             read_per_query: 2,
             max_rounds: 3,
+            auto_rounds: true,
             max_barren_rounds: 1,
             max_chunks_per_page: 6,
             harvest_max_chunks_per_page: 16,
