@@ -1544,6 +1544,90 @@ pub fn canonical_url(url: &str) -> String {
     out
 }
 
+/// Query parameters that are junk in a URL a human is meant to click.
+///
+/// Deliberately narrower than [`TRACKING_PARAMS`], which serves
+/// [`canonical_url`]'s dedup key. That list drops `lang`, `s` and `t`, which
+/// is right when deciding whether two URLs are the same page and wrong when
+/// printing one: stripping `lang` can send the reader to a different
+/// translation than the one that was actually read.
+const DISPLAY_JUNK_PARAMS: &[&str] = &[
+    "fbclid", "gclid", "igshid", "mc_cid", "mc_eid", "_ga", "ref", "error",
+];
+
+/// Is this `code=` value a session token rather than something that selects
+/// content? A country or language code is short and wordlike; a session
+/// token is long and random. `?code=ES` must survive, `?code=b980f9c2-…`
+/// must not.
+fn is_session_token(value: &str) -> bool {
+    value.len() >= 16
+        && value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-' || c == '_')
+}
+
+/// A URL fit to print as a citation: the page that was read, with the
+/// session litter removed.
+///
+/// Cleaning is separate from [`canonical_url`] on purpose. That function
+/// builds a comparison key — it lowercases, drops the scheme and sorts the
+/// query — which makes it unusable as a link. This one preserves the URL as
+/// fetched (scheme, path, ordering, fragment) and removes only parameters
+/// that carry no content identity, so the link still resolves to the
+/// document the passage came from.
+///
+/// Measured 2026-09-23 (ElGamal): the answer's one requested deliverable
+/// came back as
+/// `…/chapter/10.1007/3-540-39568-7_2?error=cookies_not_supported&code=b980f9c2-…`
+/// — Springer's cookie-wall redirect, pasted verbatim into the prose as the
+/// link to the paper.
+///
+/// A URL that will not parse is returned trimmed and otherwise untouched: a
+/// citation we cannot read is still the provenance we have.
+pub fn display_url(url: &str) -> String {
+    let raw = url.trim();
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    let has_error = parsed.query_pairs().any(|(k, _)| k == "error");
+
+    let kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(k, v)| {
+            let key = k.to_ascii_lowercase();
+            if key.starts_with("utm_") || key.starts_with("ref_") {
+                return false;
+            }
+            if DISPLAY_JUNK_PARAMS.contains(&key.as_str()) {
+                return false;
+            }
+            // `code` is only junk in the company of an `error`, or when the
+            // value is plainly a token.
+            if key == "code" && (has_error || is_session_token(v)) {
+                return false;
+            }
+            true
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let mut out = parsed.clone();
+    if kept.is_empty() {
+        out.set_query(None);
+    } else {
+        let mut pairs = out.query_pairs_mut();
+        pairs.clear();
+        for (k, v) in &kept {
+            if v.is_empty() {
+                pairs.append_key_only(k);
+            } else {
+                pairs.append_pair(k, v);
+            }
+        }
+    }
+    out.to_string()
+}
+
 /// A loose identity for a headline, used to keep one syndicated story from
 /// taking five slots.
 ///
@@ -2669,6 +2753,57 @@ mod tests {
             canonical_url("https://example.com/wiki?title=Decidim"),
             "example.com/wiki?title=Decidim"
         );
+    }
+
+    #[test]
+    fn display_url_strips_the_cookie_wall_litter_but_keeps_the_document() {
+        // The measured case: Springer's cookie-wall redirect, pasted into an
+        // answer as "the link to the paper".
+        assert_eq!(
+            display_url(
+                "https://link.springer.com/chapter/10.1007/3-540-39568-7_2\
+                 ?error=cookies_not_supported&code=b980f9c2-b2af-4653-9fc6-128d080de6aa"
+            ),
+            "https://link.springer.com/chapter/10.1007/3-540-39568-7_2"
+        );
+        // Campaign litter goes; the scheme, host case-folding by `Url`, path
+        // and fragment all stay, so the link still opens what was read.
+        assert_eq!(
+            display_url("https://example.org/a/b?utm_source=x&id=7&fbclid=y#sec3"),
+            "https://example.org/a/b?id=7#sec3"
+        );
+    }
+
+    #[test]
+    fn display_url_keeps_what_selects_the_content() {
+        // A short `code` selects content — a country, a language, a plan.
+        assert_eq!(
+            display_url("https://example.org/p?code=ES"),
+            "https://example.org/p?code=ES"
+        );
+        // `lang` is dropped by canonical_url for dedup and must survive here:
+        // stripping it sends the reader to a different translation.
+        assert_eq!(
+            display_url("https://example.org/p?lang=ca"),
+            "https://example.org/p?lang=ca"
+        );
+        // Ordinary query pages are untouched.
+        assert_eq!(
+            display_url("https://example.org/search?q=elgamal&page=2"),
+            "https://example.org/search?q=elgamal&page=2"
+        );
+        // A long random `code` is a session token even without an `error`.
+        assert_eq!(
+            display_url("https://example.org/p?code=b980f9c2b2af46539fc6128d080de6aa"),
+            "https://example.org/p"
+        );
+    }
+
+    #[test]
+    fn display_url_returns_something_citable_for_garbage() {
+        // Provenance we cannot parse is still the provenance we have.
+        assert_eq!(display_url("  not a url  "), "not a url");
+        assert_eq!(display_url(""), "");
     }
 
     #[test]

@@ -4471,12 +4471,16 @@ impl Scout {
                     // Build per-field provenance: each kept field's source is
                     // this page, its grounding the association Jev returned.
                     let mut provenance: BTreeMap<String, FieldSource> = BTreeMap::new();
+                    // A record's provenance is a citation too: it is what the
+                    // CSV's `{field}_source_url` column and the JSON payload
+                    // hand a reader who wants to check the value themselves.
+                    let cited = crate::browser::display_url(&page.url);
                     for (f, g) in &hr.per_field_grounding {
                         if hr.fields.get(f).is_some_and(|v| !v.trim().is_empty()) {
                             provenance.insert(
                                 f.clone(),
                                 FieldSource {
-                                    source_url: page.url.clone(),
+                                    source_url: cited.clone(),
                                     grounding: *g,
                                 },
                             );
@@ -4484,7 +4488,7 @@ impl Scout {
                     }
                     let record = Record {
                         fields: hr.fields,
-                        source_url: page.url.clone(),
+                        source_url: cited.clone(),
                         source_title: Some(page.title.clone()),
                         grounding: hr.entity_grounding,
                         provenance,
@@ -7505,8 +7509,13 @@ impl Scout {
                         "passage describes a superseded state of affairs; dropped"
                     );
                 }
+                // Cleaned here, at the one place page text becomes citable
+                // evidence: the writer quotes a passage's URL into the prose,
+                // and `report.sources` is built from these same passages, so
+                // cleaning once upstream keeps the link in the answer, the
+                // link in the source list and the provenance identical.
                 ScreenVerdict::Kept => out.passages.push(Passage {
-                    url: page.url.clone(),
+                    url: crate::browser::display_url(&page.url),
                     title: page.title.clone(),
                     text: chunks[i].clone(),
                     supports: triple.1,
@@ -7543,7 +7552,7 @@ impl Scout {
                             "paragraph readmitted after chunk-level quarantine"
                         );
                         out.passages.push(Passage {
-                            url: page.url.clone(),
+                            url: crate::browser::display_url(&page.url),
                             title: page.title.clone(),
                             text: subs[i].clone(),
                             supports: triple.1,
@@ -10579,7 +10588,9 @@ impl Scout {
                     rec.provenance.insert(
                         field.clone(),
                         FieldSource {
-                            source_url: url.clone(),
+                            // Cited, so cleaned — same rule as the discovery
+                            // provenance above.
+                            source_url: crate::browser::display_url(&url),
                             grounding: prob,
                         },
                     );
