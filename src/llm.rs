@@ -258,6 +258,10 @@ pub struct Ask {
     pub temperature: f32,
     /// A strict JSON schema to constrain decoding.
     pub schema: Option<Value>,
+    /// Stream the response and abort it when it stalls in a whitespace loop
+    /// (see `STALL_WHITESPACE`). Off by default; enabled where the loop was
+    /// measured.
+    pub stall_guard: bool,
 }
 
 impl Ask {
@@ -270,6 +274,7 @@ impl Ask {
             thinking: true,
             temperature: 0.3,
             schema: None,
+            stall_guard: false,
         }
     }
 
@@ -285,11 +290,17 @@ impl Ask {
             thinking: false,
             temperature: 0.0,
             schema: Some(schema),
+            stall_guard: false,
         }
     }
 
     pub fn thinking(mut self, on: bool) -> Self {
         self.thinking = on;
+        self
+    }
+
+    pub fn stall_guard(mut self, on: bool) -> Self {
+        self.stall_guard = on;
         self
     }
 
@@ -359,7 +370,12 @@ impl Llm {
                 tokio::time::sleep(backoff).await;
             }
 
-            match self.attempt(&body).await {
+            let result = if ask.stall_guard {
+                self.attempt_streaming(&body).await
+            } else {
+                self.attempt(&body).await
+            };
+            match result {
                 Ok(text) => return Ok(text),
                 Err(e) => {
                     // The reasoning budget can swallow the whole allowance, leaving
@@ -403,6 +419,159 @@ impl Llm {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("generative call failed with no error")))
     }
 
+    /// Add one response's usage to this client's counters.
+    fn record_usage(&self, usage: &Usage) {
+        self.counters.requests.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .prompt_tokens
+            .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
+        self.counters
+            .completion_tokens
+            .fetch_add(usage.completion_tokens, Ordering::Relaxed);
+        if let Some(d) = &usage.completion_tokens_details {
+            self.counters
+                .reasoning_tokens
+                .fetch_add(d.reasoning_tokens, Ordering::Relaxed);
+        }
+        // A reported cost of exactly zero (a free model) still counts as
+        // reported: the distinction the UI needs is "the endpoint told us"
+        // versus "the endpoint never says".
+        if let Some(nano) = usage.cost.and_then(nano_usd) {
+            self.counters.cost_reported.store(true, Ordering::Relaxed);
+            self.counters
+                .cost_nano_usd
+                .fetch_add(nano, Ordering::Relaxed);
+        }
+    }
+
+    /// One streamed attempt, aborted as soon as the output stalls.
+    ///
+    /// JSON-mode decoding sometimes falls into a whitespace loop: the model
+    /// writes `{` or `{"records": [` and then only whitespace until the token
+    /// ceiling — 8,192 tokens, about 200 s of nothing. It was the dominant
+    /// extraction failure: 93 of 113 failed decodes across 108 harvests
+    /// (measured 2026-09-24), each losing its pack's records and holding its
+    /// round for minutes. A buffered request can only see this at the end;
+    /// streamed, it is visible within seconds (`STALL_WHITESPACE`).
+    ///
+    /// On a stall the partial text is returned when it holds anything past
+    /// the opening structure, so `structured`'s truncation salvage keeps the
+    /// records written before the loop; otherwise the attempt fails with a
+    /// stall error and the caller's retry loop tries again. An aborted
+    /// stream sends no usage block: its output tokens are estimated and
+    /// counted, its cost cannot be (see the note below).
+    async fn attempt_streaming(&self, body: &Value) -> Result<String> {
+        let mut body = body.clone();
+        body["stream"] = json!(true);
+        // Without this the stream carries no usage, and cost reporting for
+        // every guarded call would silently go blank. Verified against
+        // openrouter.ai 2026-09-24: the final chunk carries usage with cost.
+        body["stream_options"] = json!({"include_usage": true});
+
+        let mut resp = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .header("HTTP-Referer", "https://github.com/typesafe-ai")
+            .header("X-Title", "webscout")
+            .json(&body)
+            .send()
+            .await
+            .context("sending request to the generative endpoint")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let raw = resp
+                .text()
+                .await
+                .context("reading generative response body")?;
+            bail!(
+                "generative endpoint returned HTTP {status}: {}",
+                truncate(&raw, 400)
+            );
+        }
+
+        let mut pending: Vec<u8> = Vec::new();
+        let mut content = String::new();
+        let mut usage: Option<Usage> = None;
+        let mut ws_run = 0usize;
+        let mut stalled = false;
+        'read: while let Some(bytes) = resp
+            .chunk()
+            .await
+            .context("reading generative response body")?
+        {
+            pending.extend_from_slice(&bytes);
+            // Lines split on `\n`, which never occurs inside a multi-byte
+            // UTF-8 sequence, so a chunk boundary cannot corrupt text.
+            while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(data) = sse_data(&line) else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    break 'read;
+                }
+                let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
+                    continue;
+                };
+                if let Some(err) = chunk.error {
+                    bail!(
+                        "generative endpoint streamed an error: {}",
+                        truncate(&err.to_string(), 400)
+                    );
+                }
+                if let Some(u) = chunk.usage {
+                    usage = Some(u);
+                }
+                for choice in &chunk.choices {
+                    if let Some(piece) = &choice.delta.content {
+                        ws_run = whitespace_run(ws_run, piece);
+                        content.push_str(piece);
+                    }
+                }
+                if ws_run >= STALL_WHITESPACE {
+                    stalled = true;
+                    break 'read;
+                }
+            }
+        }
+
+        match &usage {
+            Some(u) => self.record_usage(u),
+            // An aborted stream never reaches its usage block. The request
+            // and its output are still counted — tokens at the conventional
+            // four characters each — but no cost is added: the price is not
+            // known here, and an invented one would be read as measured.
+            None => {
+                self.counters.requests.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .completion_tokens
+                    .fetch_add(content.len() / 4, Ordering::Relaxed);
+            }
+        }
+
+        if stalled {
+            let kept = content.trim_end();
+            let progressed = stall_progressed(kept);
+            tracing::info!(
+                chars = content.len(),
+                kept = kept.len(),
+                progressed,
+                "structured output stalled in a whitespace loop; stream aborted"
+            );
+            if progressed {
+                return Ok(kept.to_string());
+            }
+            bail!("{STALL_TAG}the model stalled in a whitespace loop before writing any output");
+        }
+        if content.trim().is_empty() {
+            bail!("generative endpoint returned no content (streamed)");
+        }
+        Ok(content)
+    }
+
     async fn attempt(&self, body: &Value) -> Result<String> {
         let resp = self
             .http
@@ -432,27 +601,7 @@ impl Llm {
             .with_context(|| format!("decoding generative response: {}", truncate(&raw, 400)))?;
 
         if let Some(usage) = &parsed.usage {
-            self.counters.requests.fetch_add(1, Ordering::Relaxed);
-            self.counters
-                .prompt_tokens
-                .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
-            self.counters
-                .completion_tokens
-                .fetch_add(usage.completion_tokens, Ordering::Relaxed);
-            if let Some(d) = &usage.completion_tokens_details {
-                self.counters
-                    .reasoning_tokens
-                    .fetch_add(d.reasoning_tokens, Ordering::Relaxed);
-            }
-            // A reported cost of exactly zero (a free model) still counts as
-            // reported: the distinction the UI needs is "the endpoint told us"
-            // versus "the endpoint never says".
-            if let Some(nano) = usage.cost.and_then(nano_usd) {
-                self.counters.cost_reported.store(true, Ordering::Relaxed);
-                self.counters
-                    .cost_nano_usd
-                    .fetch_add(nano, Ordering::Relaxed);
-            }
+            self.record_usage(usage);
         }
 
         let choice = parsed
@@ -498,8 +647,17 @@ impl Llm {
         prompt: impl Into<String>,
         schema: Value,
     ) -> Result<T> {
-        let prompt: String = prompt.into();
-        let ask = Ask::structured(prompt.clone(), schema.clone());
+        self.structured_ask(Ask::structured(prompt, schema)).await
+    }
+
+    /// `structured` with a caller-built `Ask`, for calls that need a setting
+    /// the plain form does not expose — extraction's `stall_guard`. The ask
+    /// must carry a schema; its settings travel to the schema-in-prompt
+    /// fallback too.
+    pub async fn structured_ask<T: DeserializeOwned>(&self, ask: Ask) -> Result<T> {
+        let prompt = ask.prompt.clone();
+        let schema = ask.schema.clone().unwrap_or_else(|| json!({}));
+        let guard = ask.stall_guard;
         let attempt = self.chat(ask).await;
         let text = match attempt {
             Ok(t) => t,
@@ -513,7 +671,8 @@ impl Llm {
                     "Return ONLY a JSON object matching this schema, no prose, no code fence:\n\
                      {schema_str}\n\n{prompt}"
                 );
-                self.chat(Ask::prose(framed).thinking(false)).await?
+                self.chat(Ask::prose(framed).thinking(false).stall_guard(guard))
+                    .await?
             }
             Err(e) => return Err(e),
         };
@@ -568,6 +727,70 @@ impl Llm {
                 .then(|| usd_from_nano(self.counters.cost_nano_usd.load(Ordering::Relaxed))),
         }
     }
+}
+
+/// One server-sent event of a streamed completion.
+#[derive(Deserialize, Default)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Consecutive whitespace characters that mark a stalled structured output.
+///
+/// Legitimate JSON never holds this much whitespace in a row — even
+/// pretty-printed, the run between two tokens is a newline and an indent —
+/// while a whitespace loop reaches it within seconds.
+const STALL_WHITESPACE: usize = 256;
+
+/// Non-whitespace characters a stalled output may hold and still count as
+/// having written nothing: the opening `{"records": [` is 13.
+const STALL_OPENING: usize = 16;
+
+/// Error-message tag for a stall that produced nothing usable.
+const STALL_TAG: &str = "[stalled] ";
+
+/// The payload of one server-sent-event line, or `None` for blanks,
+/// comments (OpenRouter sends `: OPENROUTER PROCESSING` keep-alives) and
+/// other fields.
+fn sse_data(line: &str) -> Option<&str> {
+    line.trim_end_matches(['\r', '\n'])
+        .strip_prefix("data:")
+        .map(str::trim)
+}
+
+/// The whitespace run after appending `piece`: extended by trailing
+/// whitespace, reset by any non-whitespace character inside it.
+fn whitespace_run(run: usize, piece: &str) -> usize {
+    match piece.rfind(|c: char| !c.is_whitespace()) {
+        Some(i) => {
+            let after = &piece[i..];
+            after.chars().skip(1).count()
+        }
+        None => run + piece.chars().count(),
+    }
+}
+
+/// Did a stalled output get past its opening structure? Only then is it
+/// worth handing to the truncation salvage.
+fn stall_progressed(kept: &str) -> bool {
+    kept.chars().filter(|c| !c.is_whitespace()).count() > STALL_OPENING
 }
 
 impl Choice {
@@ -735,6 +958,58 @@ pub fn truncate(s: &str, n: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only `data:` lines carry payload; OpenRouter's `: OPENROUTER
+    /// PROCESSING` keep-alives and blank separators must be skipped.
+    #[test]
+    fn sse_data_reads_payload_lines_only() {
+        assert_eq!(sse_data("data: {\"a\":1}\n"), Some("{\"a\":1}"));
+        assert_eq!(sse_data("data: [DONE]\r\n"), Some("[DONE]"));
+        assert_eq!(sse_data(": OPENROUTER PROCESSING\n"), None);
+        assert_eq!(sse_data("\n"), None);
+        assert_eq!(sse_data("event: ping\n"), None);
+    }
+
+    /// The run counts only trailing whitespace, carries across stream
+    /// chunks, and any real character resets it — pretty-printed JSON never
+    /// comes near the stall threshold.
+    #[test]
+    fn whitespace_run_tracks_trailing_whitespace_across_chunks() {
+        let mut run = 0;
+        for piece in ["{\"records\": [", "\n", "  ", "\n\n"] {
+            run = whitespace_run(run, piece);
+        }
+        assert_eq!(run, 5, "a loop's whitespace accumulates across chunks");
+        run = whitespace_run(run, "  {\"name\": \"A\"}\n    ");
+        assert_eq!(run, 5, "a real token resets the run to what follows it");
+        // A pretty-printed record never approaches the stall threshold.
+        let pretty = "{\n  \"records\": [\n    {\n      \"name\": \"A\"\n    }\n  ]\n}";
+        let mut run = 0;
+        let mut worst = 0;
+        for c in pretty.chars() {
+            run = whitespace_run(run, &c.to_string());
+            worst = worst.max(run);
+        }
+        assert!(worst < STALL_WHITESPACE / 10, "worst run {worst}");
+        // A whitespace loop gets there.
+        let mut run = 0;
+        for _ in 0..300 {
+            run = whitespace_run(run, "\n");
+        }
+        assert!(run >= STALL_WHITESPACE);
+    }
+
+    /// A stall right after the opening structure has nothing to salvage; one
+    /// after complete records does, and must go to the salvage path.
+    #[test]
+    fn a_stall_counts_as_progress_only_past_the_opening() {
+        assert!(!stall_progressed("{"));
+        assert!(!stall_progressed("{\"records\": ["));
+        assert!(!stall_progressed("{ \"records\" : [ "));
+        assert!(stall_progressed(
+            "{\"records\": [{\"name\": \"CREC Gracia\", \"contact_email\": \"\"}"
+        ));
+    }
 
     #[test]
     fn nano_usd_round_trips_an_openrouter_cost() {

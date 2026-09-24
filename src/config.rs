@@ -354,15 +354,15 @@ pub struct Tunables {
     pub max_rounds: usize,
     /// Let the run decide when to stop instead of running to `max_rounds`.
     ///
-    /// On by default. A harvest then also stops when Jev judges progress has
-    /// levelled off (`plateaued`, read from a per-round history), which the
-    /// existing verdicts could not see: steer was shown one round's gain, and
-    /// its satisfied/exhausted stops are overridden while any record has an
-    /// enrichable field — on an open-ended list new half-filled records keep
-    /// that condition true forever, so only the ceiling ended the run
-    /// (measured 2026-09-23, q62: 40 of 40 rounds on every rerun). An answer
-    /// keeps its own short cap. A caller who names a number opts out: they
-    /// asked for depth, and a plateau stop would second-guess them.
+    /// On by default. A harvest with a target then also stops, once the target
+    /// is met, when Jev judges progress has levelled off (`plateaued`, read
+    /// from a per-round history) — q81 classified 41 of its 62 grantees in 5
+    /// rounds against 39 in 10. Open-ended harvests do not: measured
+    /// 2026-09-24, the verdict ran high on nearly every round of a bursty
+    /// "find all" discovery and cut q65 to 52 records and q101 to 15 against
+    /// fixed-40 baselines of 141 and 217. An answer keeps its own short cap. A
+    /// caller who names a number opts out: they asked for depth, and a
+    /// plateau stop would second-guess them.
     pub auto_rounds: bool,
     /// Consecutive rounds yielding zero new verified items before giving up.
     pub max_barren_rounds: usize,
