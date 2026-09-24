@@ -604,6 +604,45 @@ fn constraint_names_a_contact_field(m: &Mission, constraint: &str) -> bool {
 /// names are snake_case and constraint wording is prose, so
 /// `has_public_website` and "has a public website" must land on comparable
 /// token lists for the subset check below.
+/// The chunks of a page an answer mission screens: the first `cap - 1`, plus
+/// the last one when the page runs past the cap.
+///
+/// Screening is two thirds of an answer run's Jev spend, and nearly all of
+/// what it buys comes from the top of a page (measured 2026-09-24 over 30
+/// answer runs; the cap itself is sized in `Tunables::max_chunks_per_page`).
+/// The last chunk is kept because it is where a
+/// page puts its footer, and a footer is exactly where contact emails,
+/// registered addresses and legal notices live; a plain first-N cap would
+/// drop precisely the facts some questions ask for.
+fn head_and_tail(mut chunks: Vec<String>, cap: usize) -> Vec<String> {
+    if cap == 0 || chunks.len() <= cap {
+        return chunks;
+    }
+    let last = chunks.pop().expect("more chunks than a non-zero cap");
+    chunks.truncate(cap - 1);
+    chunks.push(last);
+    chunks
+}
+
+/// The question's content words, folded: 4+ characters, instruction and
+/// function words dropped. Used only to measure lexical overlap between a
+/// question and a page chunk.
+fn query_content_terms(query: &str) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        "find", "tell", "provide", "give", "show", "list", "what", "when", "where", "which", "who",
+        "whom", "whose", "that", "this", "with", "from", "about", "does", "have", "into", "their",
+        "there", "them", "they", "your", "please", "also", "only", "were", "was", "been", "being",
+        "will", "would", "should", "could", "public", "official",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for t in fold_ascii_lower(query).split(|c: char| !c.is_alphanumeric()) {
+        if t.len() >= 4 && !SKIP.contains(&t) && !out.iter().any(|o| o == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
 fn word_tokens(s: &str) -> Vec<String> {
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -6999,12 +7038,7 @@ impl Scout {
                     report.stats.pages_fetched += 1;
                     seen_urls.insert(page.url.clone());
                     let g = self
-                        .screen_page(
-                            &mission.query,
-                            mission.time_sensitive,
-                            self.t().chunk_cap(false),
-                            page,
-                        )
+                        .screen_page(&mission.query, mission.time_sensitive, false, page)
                         .await;
                     report.stats.chunks_examined += g.chunks_examined;
                     report.stats.quarantined += g.quarantined_chunks;
@@ -7129,12 +7163,7 @@ impl Scout {
                         report.stats.pages_fetched += 1;
                         seen_urls.insert(page.url.clone());
                         let g = self
-                            .screen_page(
-                                &mission.query,
-                                mission.time_sensitive,
-                                self.t().chunk_cap(false),
-                                page,
-                            )
+                            .screen_page(&mission.query, mission.time_sensitive, false, page)
                             .await;
                         report.stats.chunks_examined += g.chunks_examined;
                         report.stats.quarantined += g.quarantined_chunks;
@@ -7968,7 +7997,7 @@ impl Scout {
                 self.screen_page(
                     &mission.query,
                     mission.time_sensitive,
-                    self.t().chunk_cap(mission.is_harvest()),
+                    mission.is_harvest(),
                     page,
                 )
             })
@@ -8010,7 +8039,7 @@ impl Scout {
                     .screen_page(
                         &mission.query,
                         mission.time_sensitive,
-                        self.t().chunk_cap(mission.is_harvest()),
+                        mission.is_harvest(),
                         page.clone(),
                     )
                     .await;
@@ -8045,10 +8074,18 @@ impl Scout {
         &self,
         query: &str,
         time_sensitive: bool,
-        max_chunks: usize,
+        harvest: bool,
         page: crate::browser::PageContent,
     ) -> PagePassages {
-        let chunks = chunk(&page.text, self.t().chunk_chars, max_chunks);
+        let cap = self.t().chunk_cap(harvest);
+        // A harvest keeps the first `cap` chunks: its value is the long tail
+        // of a register, read in order. An answer keeps the head and the last
+        // chunk — see `head_and_tail`.
+        let chunks = if harvest {
+            chunk(&page.text, self.t().chunk_chars, cap)
+        } else {
+            head_and_tail(chunk(&page.text, self.t().chunk_chars, 0), cap)
+        };
         let mut out = PagePassages {
             url: page.url.clone(),
             passages: Vec::new(),
@@ -8066,6 +8103,32 @@ impl Scout {
             )
             .await;
         let mut quarantined: Vec<String> = Vec::new();
+        // Per-chunk screening outcome beside a code-only lexical overlap, for
+        // measuring what a cheaper pre-filter would have cost: screening is
+        // two thirds of a run's Jev spend (measured 2026-09-24), and only the
+        // chunks that can become evidence ever need it. Debug only; the
+        // overlap decides nothing here.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let qterms = query_content_terms(query);
+            for (i, triple) in screened.iter().enumerate() {
+                let folded = fold_ascii_lower(&chunks[i]);
+                let hits = qterms
+                    .iter()
+                    .filter(|t| folded.contains(t.as_str()))
+                    .count();
+                tracing::debug!(
+                    url = %page.url,
+                    chunk = i,
+                    chars = chunks[i].len(),
+                    supports = triple.1,
+                    injection = triple.0,
+                    overlap = hits,
+                    terms = qterms.len(),
+                    verdict = ?screen_verdict(&self.t(), triple),
+                    "screen chunk"
+                );
+            }
+        }
         for (i, triple) in screened.iter().enumerate() {
             match screen_verdict(&self.t(), triple) {
                 ScreenVerdict::Quarantined => {
@@ -15234,6 +15297,29 @@ mod tests {
         assert!(q.contains("DIFFERENT instance"), "{q}");
         // A page that does not say which set it lists must be able to say no.
         assert!(q.contains("does not say which instance"), "{q}");
+    }
+
+    /// An answer screens a page's head plus its last chunk: nothing past the
+    /// head was ever cited in the measured sample, and the footer is where
+    /// contact emails and registered addresses live.
+    #[test]
+    fn head_and_tail_keeps_the_top_and_the_footer() {
+        let page: Vec<String> = (0..10).map(|i| format!("c{i}")).collect();
+        assert_eq!(
+            head_and_tail(page.clone(), 5),
+            vec!["c0", "c1", "c2", "c3", "c9"]
+        );
+        // A page within the cap is untouched, in order.
+        let short: Vec<String> = (0..4).map(|i| format!("c{i}")).collect();
+        assert_eq!(head_and_tail(short.clone(), 5), short);
+        assert_eq!(
+            head_and_tail(page.clone()[..5].to_vec(), 5),
+            page[..5].to_vec()
+        );
+        // Zero means no cap, as it does for `chunk`.
+        assert_eq!(head_and_tail(page.clone(), 0), page);
+        // A cap of one keeps only the last chunk: the cap is honoured exactly.
+        assert_eq!(head_and_tail(page.clone(), 1), vec!["c9"]);
     }
 
     /// A long enumeration is split into windows that each fit the budget, in

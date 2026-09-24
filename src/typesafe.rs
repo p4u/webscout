@@ -521,6 +521,24 @@ impl Jev {
         self.counters
             .input_tokens
             .fetch_add(parsed.usage.input_tokens, Ordering::Relaxed);
+        // Per-request usage, labelled by the request's question ids, so a
+        // run's Jev spend can be attributed to the stage that asked: the ids
+        // name it (`answered` is the evidence assessment, `k0…` the claim
+        // check, `c0` enumeration completeness). The stats only carried the
+        // run total, which cannot say where 156k tokens per answer went.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let ids: Vec<&str> = body["questions"]
+                .as_object()
+                .map(|q| q.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            tracing::debug!(
+                input_tokens = parsed.usage.input_tokens,
+                questions = ids.len(),
+                first = ids.first().copied().unwrap_or(""),
+                state_chars = body["state"].to_string().len(),
+                "jev usage"
+            );
+        }
 
         // Update the chars-per-token EMA so budget_chars() can grow toward the
         // observed ratio. Guard against zero (the field is default-zero and some

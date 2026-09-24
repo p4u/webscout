@@ -401,10 +401,16 @@ pub struct Tunables {
 
     // --- Chunking ---
     pub chunk_chars: usize,
-    /// Chunks screened per page for an answer mission.
+    /// Chunks screened per page for an answer mission: the head, plus the page's
+    /// last chunk once the page runs past the cap (see `head_and_tail`).
     ///
     /// An answer needs two or three passages that settle the question; screening the
-    /// rest of a long page is money spent to confirm what you already have.
+    /// rest of a long page is money spent to confirm what you already have. Measured
+    /// 2026-09-24 over 30 answer runs, every final evidence passage traced back to its
+    /// chunk and every answer sentence to its citations: a cap of 7 screens 17% fewer
+    /// chunks and loses no sentence whose only support was cut; 6 loses four such
+    /// sentences, 5 loses seven. Default 7 (was 10); the quick and thorough presets
+    /// were not measured and keep their values.
     pub max_chunks_per_page: usize,
     /// Chunks screened per page for a harvest.
     ///
@@ -575,7 +581,7 @@ impl Default for Tunables {
             max_questions_per_request: 192,
 
             chunk_chars: 4000,
-            max_chunks_per_page: 10,
+            max_chunks_per_page: 7,
             harvest_max_chunks_per_page: 40,
 
             concurrency: 8,
