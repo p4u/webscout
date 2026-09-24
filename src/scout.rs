@@ -483,6 +483,57 @@ fn constraint_names_the_set(m: &Mission, constraint: &str) -> bool {
     })
 }
 
+/// Does this page list a DIFFERENT instance of the set a set-defining
+/// constraint names — another year's call, another edition or round?
+///
+/// Asked only for set-defining constraints (`constraint_names_the_set`) and
+/// only of pages that yielded records. A record from such a page is not
+/// "unverified": the page is positive evidence about another set, and saying
+/// nothing about this one is exactly what a list of another year does. Pages
+/// that do not say which set they list — directories, news — must answer no,
+/// so their records stay as they were (measured 2026-09-24, q81: the NEOTEC
+/// 2025 provisional proposal contributed 42 companies that sat beside the 62
+/// real 2024 grantees, every one `not_addressed` on the 2024 criterion).
+fn other_set_question(constraint: &str) -> Value {
+    let clean = constraint.replace('`', "'");
+    noul(
+        &format!(
+            "The criterion `{clean}` names one particular set — a specific year, call, \
+             edition or round. Is the list in `passages` a list of a DIFFERENT instance \
+             of it rather than the one the criterion names?"
+        ),
+        "Yes: the page lists another instance — for example the criterion names the \
+         2024 call and the page is the 2025 call's list.",
+        "No: the page lists the named instance, or does not say which instance it lists, \
+         or is not a list of that kind of set at all.",
+    )
+}
+
+/// At or above this, a page is judged a list of another instance of the set.
+const OTHER_SET_FLOOR: f64 = 0.7;
+
+/// Keys of records to exclude because `page` (citation form) was judged a list
+/// of another instance of the set, for the constraints in `other`: records
+/// whose source is that page and which no evidence supports on those
+/// constraints. A record that some other page supported keeps its place — a
+/// company in both years' lists is still a 2024 grantee.
+fn other_set_exclusions(
+    store: &BTreeMap<String, Record>,
+    page: &str,
+    other: &[usize],
+) -> Vec<String> {
+    store
+        .iter()
+        .filter(|(_, r)| crate::browser::display_url(&r.source_url) == page)
+        .filter(|(_, r)| {
+            other.iter().any(|&i| {
+                r.constraint_status.get(i) != Some(&crate::types::ConstraintVerdict::Supports)
+            })
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 /// The extraction-phase rendering of the same filtered target: entries, not
 /// pages. Grounding still judges every constraint per record against the
 /// passage (five-way choice with the gloss, page-level rescue), and
@@ -1581,6 +1632,7 @@ fn plateau_stop(
     round: usize,
     plateaued: f64,
     history: &[RoundSnapshot],
+    target: Option<usize>,
 ) -> bool {
     let clean = history
         .iter()
@@ -1591,7 +1643,24 @@ fn plateau_stop(
     // more effort yields little, and effort not yet spent says nothing either
     // way (q62: 454 found, 3 providers, stopped at round 4).
     let all_tried = history.last().is_some_and(|h| h.untried == 0);
-    auto_rounds && round >= AUTO_MIN_ROUNDS && plateaued >= 0.7 && clean && all_tried
+    let found = history.last().map_or(0, |h| h.found);
+    // A flat line at zero is discovery failing, not a result levelling off:
+    // that is the source-shortage and re-aim path's to handle, and a fixed
+    // ceiling would have kept trying (measured 2026-09-24, q81: news pages
+    // only, the resolution never reached, stopped at round 4 on a 0.93
+    // plateau with nothing found).
+    let something_found = found > 0;
+    // "Discovery never stops early when entity count is below target"
+    // (CLAUDE.md invariants) binds this stop too — the same q81 run asked
+    // for 62 and stopped at 0.
+    let target_met = target.is_none_or(|t| found >= t);
+    auto_rounds
+        && round >= AUTO_MIN_ROUNDS
+        && plateaued >= 0.7
+        && clean
+        && all_tried
+        && something_found
+        && target_met
 }
 
 /// Recent rounds that must all have searched successfully before a plateau
@@ -1737,6 +1806,36 @@ pub(crate) fn on_anchor_site(url: &str, anchors: &[String]) -> bool {
                 && folded.chars().all(|c| c.is_alphanumeric())
                 && host.split('.').any(|l| l == folded))
     })
+}
+
+/// Split a page's chunks into consecutive windows whose serialized size
+/// each fits `budget` characters, in page order.
+///
+/// The enumeration gate sent a page's chunks whole: the definitive NEOTEC
+/// 2024 resolution — the one complete list of the 62 grantees — is 158,000
+/// characters, over Jev's ~100,000-character state limit, so the
+/// completeness ask failed on every run, the gate never armed, and 42
+/// companies from the next year's call stayed in the output (measured
+/// 2026-09-24, q81). The pages worth arming the gate are exactly the long
+/// ones. A window always holds at least one chunk: a single chunk is capped
+/// at `chunk_chars` and fits any budget this is called with.
+fn chunk_windows(chunks: &[String], budget: usize) -> Vec<Vec<String>> {
+    let mut windows: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for c in chunks {
+        let cost = crate::typesafe::state_cost(c) + 1;
+        if !current.is_empty() && used + cost > budget {
+            windows.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += cost;
+        current.push(c.clone());
+    }
+    if !current.is_empty() {
+        windows.push(current);
+    }
+    windows
 }
 
 /// State for the anchor-enumeration corroboration gate: pages on the
@@ -4816,25 +4915,38 @@ impl Scout {
                         mission.entity_type.trim()
                     };
                     if !chunks.is_empty() {
-                        let state = json!({"page_url": page.url, "passages": chunks});
+                        // The head of the page, within Jev's state budget: a
+                        // document says what it lists, and starts listing it,
+                        // at the top. The whole page did not fit (see
+                        // `chunk_windows`), so the ask failed and the gate
+                        // never armed on the long lists it exists for.
+                        // The set is the mission's full topic, not its entity type: asked
+                        // whether the NEOTEC 2024 resolution completely enumerates "all
+                        // companies", Jev correctly said no (0.00) and the gate stayed off
+                        // (measured 2026-09-24, q81). The Linear case only worked because
+                        // its entity type, "pricing plans", happened to name the set. The
+                        // topic, not the listing core: the core drops the year, and 2024
+                        // versus 2025 is the distinction this gate exists to draw.
+                        let set = if mission.topic.trim().is_empty() {
+                            et
+                        } else {
+                            mission.topic.trim()
+                        };
                         let q = noul(
                             &format!(
                                 "Taken as a whole, do `passages` constitute a complete \
-                                     enumeration of all {et} — none deliberately omitted — \
+                                     enumeration of all {set} — none deliberately omitted — \
                                      rather than a partial list, a set of examples, or a \
                                      subset such as one region's or one federation's members?"
                             ),
                             "A complete enumeration: the page presents the full set, and a reader could rely on an unlisted item not being part of it.",
                             "A partial view: examples, a subset, a selection, or a page about something else.",
                         );
-                        match self
-                            .jev
-                            .ask(
-                                state,
-                                crate::typesafe::questions(vec![("c0".to_string(), q)]),
-                            )
-                            .await
-                        {
+                        let qs = crate::typesafe::questions(vec![("c0".to_string(), q)]);
+                        // Only the head: a document says what it lists at the top. Sized
+                        // and shrunk to what the server accepts (see `ask_head`).
+                        let verdict = self.ask_head(&page.url, &chunks, &qs).await;
+                        match verdict {
                             Ok(a) if a.noul("c0") >= self.t().enum_completeness_floor => {
                                 tracing::info!(
                                     url = %page.url,
@@ -4853,6 +4965,68 @@ impl Scout {
                                 error = %e,
                                 url = %page.url,
                                 "enumeration-completeness ask failed"
+                            ),
+                        }
+                    }
+                }
+                // A page that lists another instance of a set-defining
+                // constraint's set contributes nothing to this one; see
+                // `other_set_question`. One ask per productive page, the
+                // page's head only (a list states its year at the top).
+                let set_idx: Vec<usize> = mission
+                    .constraints
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| constraint_names_the_set(mission, c))
+                    .map(|(i, _)| i)
+                    .collect();
+                if !named.is_empty()
+                    && !set_idx.is_empty()
+                    && let Some(pc) = fetched
+                        .pages
+                        .iter()
+                        .find(|pc| pc.url == page.url || pc.requested_url == page.url)
+                {
+                    let chunks = crate::browser::chunk(
+                        &pc.text,
+                        self.t().chunk_chars,
+                        self.t().chunk_cap(true),
+                    );
+                    let qs = crate::typesafe::questions(
+                        set_idx
+                            .iter()
+                            .map(|&i| {
+                                (format!("o{i}"), other_set_question(&mission.constraints[i]))
+                            })
+                            .collect(),
+                    );
+                    if !chunks.is_empty() {
+                        match self.ask_head(&page.url, &chunks, &qs).await {
+                            Ok(a) => {
+                                let other: Vec<usize> = set_idx
+                                    .iter()
+                                    .copied()
+                                    .filter(|&i| a.noul(&format!("o{i}")) >= OTHER_SET_FLOOR)
+                                    .collect();
+                                if !other.is_empty() {
+                                    let cited = crate::browser::display_url(&page.url);
+                                    let drop = other_set_exclusions(&store, &cited, &other);
+                                    for k in &drop {
+                                        store.remove(k);
+                                    }
+                                    report.stats.other_set_excluded += drop.len();
+                                    tracing::info!(
+                                        url = %page.url,
+                                        excluded = drop.len(),
+                                        "page lists another instance of the set; its unsupported records excluded"
+                                    );
+                                }
+                            }
+                            // A failed ask never excludes anything.
+                            Err(e) => tracing::debug!(
+                                error = %e,
+                                url = %page.url,
+                                "other-set ask failed"
                             ),
                         }
                     }
@@ -5113,7 +5287,13 @@ impl Scout {
                             t.enrich_batch = (t.enrich_batch * 2).min(60);
                         }
                     }
-                    if plateau_stop(self.t().auto_rounds, round, s.plateaued, &history) {
+                    if plateau_stop(
+                        self.t().auto_rounds,
+                        round,
+                        s.plateaued,
+                        &history,
+                        mission.target_count,
+                    ) {
                         tracing::info!(
                             round,
                             plateaued = s.plateaued,
@@ -5373,6 +5553,14 @@ impl Scout {
             Outcome::Partial
         };
 
+        if report.stats.other_set_excluded > 0 {
+            report.notes.push(format!(
+                "{} record(s) excluded: they came only from a page listing another instance \
+                 of the set asked about (another year's call or edition), and nothing \
+                 supported them as members of this one.",
+                report.stats.other_set_excluded
+            ));
+        }
         if stopped_on_plateau && report.outcome != Outcome::Complete {
             report.notes.push(format!(
                 "Stopped automatically after {} round(s): progress had levelled off. Re-run \
@@ -9396,6 +9584,94 @@ impl Scout {
     /// the same entity. Merge on score ≥ 1.5 (i.e. beyond the "possibly
     /// same" midpoint), preferring the better-grounded values, unioning
     /// provenance.
+    /// Ask `questions` about the head of a page: as many leading chunks as
+    /// the state budget allows, shrunk further while the server refuses the
+    /// request as oversized. The state says how much of the page is shown, so
+    /// a truncated view is never mistaken for a short page.
+    ///
+    /// For questions a document answers at its top — what it lists, which
+    /// year's call it resolves — where reading every part would only cost
+    /// more requests. See `ask_over_parts` for the whole-page case.
+    async fn ask_head(
+        &self,
+        page_url: &str,
+        chunks: &[String],
+        questions: &serde_json::Map<String, Value>,
+    ) -> Result<Answers> {
+        let budget = self.jev.state_budget_chars().saturating_sub(6_000);
+        let mut head = chunk_windows(chunks, budget)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        loop {
+            let shown = format!(
+                "The first {} of the page's {} parts; the rest is omitted for length.",
+                head.len(),
+                chunks.len()
+            );
+            let state = json!({"page_url": page_url, "shown": shown, "passages": head});
+            match self.jev.ask(state, questions.clone()).await {
+                Err(e) if crate::typesafe::is_oversized(&e) && head.len() > 1 => {
+                    head.truncate(head.len() / 2);
+                    tracing::debug!(url = %page_url, parts = head.len(), "page head oversized; shrinking");
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Ask `questions` against every part of `window`, halving any part the
+    /// server rejects as oversized, and return one verdict per part answered.
+    ///
+    /// `chunk_windows` sizes windows from an adaptive chars-per-token
+    /// estimate, and an estimate is not a contract: the NEOTEC resolution —
+    /// a table of names, tax IDs and amounts — tokenises denser than prose,
+    /// and a window sized to fit was still refused with `max_tokens_exceeded`
+    /// (measured 2026-09-24, q81). The server's refusal is the ground truth,
+    /// so it drives the split, as `split_on_oversize` already does for
+    /// question batches. A single chunk that is still refused is dropped:
+    /// no verdict is ever invented for text Jev did not read.
+    ///
+    /// The flag says whether every part was read. Callers that turn silence
+    /// into a verdict must check it: a name in an unread part would otherwise
+    /// be "absent" on evidence nobody saw.
+    async fn ask_over_parts(
+        &self,
+        page_url: &str,
+        window: Vec<String>,
+        questions: &serde_json::Map<String, Value>,
+        extra: Option<(&str, String)>,
+    ) -> (Vec<Answers>, bool) {
+        let mut out = Vec::new();
+        let mut all_read = true;
+        let mut queue: VecDeque<Vec<String>> = VecDeque::from([window]);
+        while let Some(part) = queue.pop_front() {
+            let mut state = json!({"page_url": page_url, "passages": part});
+            if let Some((k, v)) = &extra {
+                state[*k] = json!(v);
+            }
+            match self.jev.ask(state, questions.clone()).await {
+                Ok(a) => out.push(a),
+                Err(e) if crate::typesafe::is_oversized(&e) && part.len() > 1 => {
+                    let mut first = part;
+                    let second = first.split_off(first.len() / 2);
+                    tracing::debug!(
+                        page = %page_url,
+                        halves = ?(first.len(), second.len()),
+                        "enumeration window oversized; splitting"
+                    );
+                    queue.push_front(second);
+                    queue.push_front(first);
+                }
+                Err(e) => {
+                    all_read = false;
+                    tracing::debug!(error = %e, page = %page_url, "enumeration ask failed; no verdict for this part");
+                }
+            }
+        }
+        (out, all_read)
+    }
+
     /// Anchor-enumeration corroboration gate.
     ///
     /// When a mission is *about* one organisation ("the pricing page for
@@ -9421,11 +9697,23 @@ impl Scout {
         if anchor_enum.pages.is_empty() || anchor_enum.yield_count < self.t().enum_min_yield {
             return;
         }
-        // Records the anchor's own site contributed are exempt; everything
-        // else is what the gate exists to check.
+        // Records a complete enumeration itself contributed are exempt: they
+        // are on the list by construction. Everything else is checked,
+        // INCLUDING other pages of the anchor's own site. The exemption used
+        // to be the whole domain, but the authority is the list, not the
+        // domain that hosts it: cdti.es publishes the 2023, 2024 and 2025
+        // calls, and 42 companies from the 2025 provisional proposal passed
+        // unchecked beside the 62 real 2024 grantees (measured 2026-09-24,
+        // q81). URLs compare in citation form, which is how `source_url` is
+        // now stored.
+        let enum_urls: HashSet<String> = anchor_enum
+            .pages
+            .iter()
+            .map(|(u, _)| crate::browser::display_url(u))
+            .collect();
         let candidates: Vec<(String, String)> = store
             .iter()
-            .filter(|(_, r)| !on_anchor_site(&r.source_url, &mission.anchors))
+            .filter(|(_, r)| !enum_urls.contains(&crate::browser::display_url(&r.source_url)))
             .map(|(k, r)| {
                 (
                     k.clone(),
@@ -9450,6 +9738,28 @@ impl Scout {
         // enumeration keeps the record.
         let mut best: HashMap<String, f64> = HashMap::new();
         for (url, chunks) in &anchor_enum.pages {
+            // Every window of the page is read — a name can sit anywhere in a
+            // long list — and presence is the max across windows, as it
+            // already was across pages.
+            let q_cost: usize = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, (_, n))| {
+                    crate::typesafe::question_cost(
+                        &format!("e{i}"),
+                        &noul(
+                            &format!("Does this page mention `{n}` as one of the {et}?"),
+                            "The page itself names it as one of them.",
+                            "The name does not appear, or appears only as something else.",
+                        ),
+                    )
+                })
+                .sum();
+            let budget = self.jev.state_budget_chars().saturating_sub(4_000).min(
+                self.jev
+                    .request_budget_chars()
+                    .saturating_sub(q_cost + 8_000),
+            );
             let mut qs: Vec<(String, Value)> = Vec::with_capacity(candidates.len());
             for (i, (_, name)) in candidates.iter().enumerate() {
                 let clean = name.replace('`', "'");
@@ -9462,18 +9772,28 @@ impl Scout {
                     ),
                 ));
             }
-            let state = json!({"page_url": url, "passages": chunks});
-            let Ok(a) = self.jev.ask(state, crate::typesafe::questions(qs)).await else {
-                // A failed ask never drops anything.
-                continue;
-            };
-            for (i, (key, name)) in candidates.iter().enumerate() {
-                let p = a.noul(&format!("e{i}"));
-                let e = best.entry(key.clone()).or_insert(0.0);
-                if p > *e {
-                    *e = p;
+            let qs = crate::typesafe::questions(qs);
+            for window in chunk_windows(chunks, budget) {
+                // A failed part never drops anything: it simply contributes no
+                // presence, and an entity no part measured reads as present below.
+                let (answers, all_read) = self.ask_over_parts(url, window, &qs, None).await;
+                if !all_read {
+                    // Part of this page went unread, so its silence proves
+                    // nothing about anyone: every candidate counts as present.
+                    for (key, _) in &candidates {
+                        best.insert(key.clone(), 1.0);
+                    }
                 }
-                tracing::debug!(entity = %name, page = %url, presence = p, "enumeration presence");
+                for a in answers {
+                    for (i, (key, name)) in candidates.iter().enumerate() {
+                        let p = a.noul(&format!("e{i}"));
+                        let e = best.entry(key.clone()).or_insert(0.0);
+                        if p > *e {
+                            *e = p;
+                        }
+                        tracing::debug!(entity = %name, page = %url, presence = p, "enumeration presence");
+                    }
+                }
             }
         }
 
@@ -14882,6 +15202,69 @@ mod tests {
         assert!(answer_parts(&single).is_empty());
     }
 
+    /// Only records whose source is the other-set page, and only those no
+    /// evidence supports on the set-defining constraint, are excluded: a
+    /// company in both years' lists stays a 2024 grantee.
+    #[test]
+    fn other_set_exclusions_spare_anything_supported() {
+        use crate::types::ConstraintVerdict::{NotAddressed, Supports};
+        let rec = |url: &str, set: crate::types::ConstraintVerdict| Record {
+            source_url: url.to_string(),
+            constraint_status: vec![Supports, set],
+            ..Default::default()
+        };
+        let p25 = "https://www.cdti.es/files/propuesta_sneo_2025.pdf";
+        let p24 = "https://www.cdti.es/files/resolucion_neotec_2024.pdf";
+        let mut store = BTreeMap::new();
+        store.insert("only_2025".to_string(), rec(p25, NotAddressed));
+        store.insert("both_years".to_string(), rec(p25, Supports));
+        store.insert("real_2024".to_string(), rec(p24, Supports));
+        store.insert("unsure_2024_page".to_string(), rec(p24, NotAddressed));
+
+        let drop = other_set_exclusions(&store, p25, &[1]);
+        assert_eq!(drop, vec!["only_2025".to_string()]);
+        // Only constraints judged other-set count: constraint 0 is untouched.
+        assert!(other_set_exclusions(&store, p25, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_other_set_question_names_the_criterion_and_its_escape_hatch() {
+        let q = other_set_question("was awarded a grant in the CDTI NEOTEC 2024 call").to_string();
+        assert!(q.contains("NEOTEC 2024"), "{q}");
+        assert!(q.contains("DIFFERENT instance"), "{q}");
+        // A page that does not say which set it lists must be able to say no.
+        assert!(q.contains("does not say which instance"), "{q}");
+    }
+
+    /// A long enumeration is split into windows that each fit the budget, in
+    /// page order, with nothing lost — the gate must be able to read a
+    /// 158,000-character resolution, which is exactly the page worth arming it.
+    #[test]
+    fn chunk_windows_fit_the_budget_and_keep_every_chunk() {
+        let chunks: Vec<String> = (0..40)
+            .map(|i| format!("{i:02}{}", "x".repeat(3998)))
+            .collect();
+        let budget = 100_000;
+        let windows = chunk_windows(&chunks, budget);
+        assert!(windows.len() >= 2, "a 160k-char page cannot be one window");
+        for w in &windows {
+            let cost: usize = w.iter().map(|c| crate::typesafe::state_cost(c) + 1).sum();
+            assert!(cost <= budget, "window of {cost} chars over {budget}");
+        }
+        let flat: Vec<String> = windows.into_iter().flatten().collect();
+        assert_eq!(flat, chunks, "every chunk, in order, exactly once");
+
+        // A page that fits is one window, unchanged.
+        let small: Vec<String> = vec!["a".repeat(100), "b".repeat(100)];
+        assert_eq!(chunk_windows(&small, budget), vec![small.clone()]);
+        // Nothing in, nothing out.
+        assert!(chunk_windows(&[], budget).is_empty());
+        // A chunk larger than the budget still gets a window of its own
+        // rather than vanishing.
+        let big = vec!["z".repeat(500)];
+        assert_eq!(chunk_windows(&big, 100), vec![big.clone()]);
+    }
+
     /// A plateau ends a harvest only under auto, only with a trajectory to
     /// read, and only on a decisive verdict — never when the caller named a
     /// number, and never because the ask failed (which reads 0.0).
@@ -14896,25 +15279,25 @@ mod tests {
             untried: 0,
         };
         let clean: Vec<RoundSnapshot> = (1..=4).map(|r| snap(r, false)).collect();
-        assert!(plateau_stop(true, AUTO_MIN_ROUNDS, 0.8, &clean));
+        assert!(plateau_stop(true, AUTO_MIN_ROUNDS, 0.8, &clean, None));
         assert!(
-            !plateau_stop(false, 30, 0.95, &clean),
+            !plateau_stop(false, 30, 0.95, &clean, None),
             "a fixed ceiling is honoured"
         );
         assert!(
-            !plateau_stop(true, AUTO_MIN_ROUNDS - 1, 0.95, &clean),
+            !plateau_stop(true, AUTO_MIN_ROUNDS - 1, 0.95, &clean, None),
             "too early to read a curve"
         );
-        assert!(!plateau_stop(true, 10, 0.55, &clean), "not decisive");
+        assert!(!plateau_stop(true, 10, 0.55, &clean, None), "not decisive");
         assert!(
-            !plateau_stop(true, 10, 0.0, &clean),
+            !plateau_stop(true, 10, 0.0, &clean, None),
             "a failed ask is not a plateau"
         );
 
         // q81, 2026-09-24: rounds 3 and 4 lost their searches to the lane
         // deadline. The flat line is our failure, not the web's.
         let starved = vec![snap(1, false), snap(2, false), snap(3, true), snap(4, true)];
-        assert!(!plateau_stop(true, 4, 0.93, &starved));
+        assert!(!plateau_stop(true, 4, 0.93, &starved, None));
         // One starved round anywhere in the window is enough to veto...
         let one = vec![
             snap(1, false),
@@ -14922,7 +15305,7 @@ mod tests {
             snap(3, false),
             snap(4, false),
         ];
-        assert!(!plateau_stop(true, 4, 0.93, &one));
+        assert!(!plateau_stop(true, 4, 0.93, &one, None));
         // ...but a failure that has aged out of the window no longer does.
         let aged = vec![
             snap(1, true),
@@ -14930,15 +15313,27 @@ mod tests {
             snap(3, false),
             snap(4, false),
         ];
-        assert!(plateau_stop(true, 4, 0.93, &aged));
+        assert!(plateau_stop(true, 4, 0.93, &aged, None));
 
         // q62, 2026-09-24: 454 found, nearly every provider pair never tried.
         // A plateau cannot be read off effort that was never spent.
         let mut untouched = clean.clone();
         untouched.last_mut().unwrap().untried = 880;
-        assert!(!plateau_stop(true, 4, 0.72, &untouched));
+        assert!(!plateau_stop(true, 4, 0.72, &untouched, None));
+        // Nothing found is discovery failing, not a plateau (q81, 2026-09-24).
+        let mut empty = clean.clone();
+        for h in &mut empty {
+            h.found = 0;
+        }
+        assert!(!plateau_stop(true, 4, 0.93, &empty, None));
+        // Below a named target the invariant holds: never stop early.
+        assert!(
+            !plateau_stop(true, 4, 0.93, &clean, Some(100)),
+            "62 found of 100"
+        );
+        assert!(plateau_stop(true, 4, 0.93, &clean, Some(62)), "target met");
         // No history at all is not a trajectory either.
-        assert!(!plateau_stop(true, 4, 0.95, &[]));
+        assert!(!plateau_stop(true, 4, 0.95, &[], None));
     }
 
     /// Under auto an answer keeps its short cap; a chosen number is honoured

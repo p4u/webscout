@@ -881,6 +881,14 @@ pub struct Stats {
     /// anchor domain never mentioned their entity — third-party pages
     /// inventing members of a list the authoritative page completes.
     pub anchor_unmentioned: usize,
+    /// Records dropped because the only page that listed them was judged a
+    /// list of a DIFFERENT instance of the set the mission names — another
+    /// year's call, another edition — and their set-defining constraint was
+    /// never supported elsewhere. Measured 2026-09-24 (q81): 42 companies from
+    /// the NEOTEC 2025 provisional proposal sat beside the 62 real 2024
+    /// grantees as unverified records.
+    #[serde(default)]
+    pub other_set_excluded: usize,
     /// Records dropped because their name is only the mission's own category
     /// ("crm" for a mission about "open-source CRM projects"). Such a key is a
     /// hub: the containment prefilter matches it against every name that

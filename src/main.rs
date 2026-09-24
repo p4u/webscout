@@ -819,6 +819,7 @@ fn run_summary(report: &crate::types::ScoutReport) -> String {
         || st.excluded_contradicted > 0
         || st.constraints_unverified > 0
         || st.wrong_entity_rejected > 0
+        || st.other_set_excluded > 0
     {
         let _ = write!(
             s,
@@ -832,6 +833,13 @@ fn run_summary(report: &crate::types::ScoutReport) -> String {
                 s,
                 " · {} contradicted record(s) excluded",
                 st.excluded_contradicted
+            );
+        }
+        if st.other_set_excluded > 0 {
+            let _ = write!(
+                s,
+                " · {} record(s) from another edition of the set excluded",
+                st.other_set_excluded
             );
         }
         if st.wrong_entity_rejected > 0 {
