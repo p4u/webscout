@@ -1322,23 +1322,51 @@ fn strip_tags(html: &str) -> String {
     let mut low = lower.as_str();
 
     loop {
-        // Elements whose contents are code, not prose.
+        // Elements whose contents are code, not prose. Checked at every `<`,
+        // not only where one tag follows another: the check used to run only
+        // when the previous tag's `>` was immediately followed by `<style`, so
+        // a single newline in between let the whole block through as text.
+        // Real markup nearly always has that newline — a WordPress page read
+        // over HTTP came back 69,000 characters, mostly inline CSS, where the
+        // browser saw 2,500 of prose; the bio chunk screened at 0.30 support
+        // diluted by stylesheet, and the page had to be re-rendered to be
+        // usable at all (measured 2026-09-24).
+        //
+        // `<head>` is not skipped whole: it holds no prose of its own (its
+        // `<style>` and `<script>` are dropped here one by one), and it is
+        // where a page declares its structured data — see below.
         let mut skipped = false;
-        for tag in ["script", "style", "noscript", "svg", "head"] {
-            let open = format!("<{tag}");
-            if low.starts_with(&open) {
-                let close = format!("</{tag}>");
-                match low.find(&close) {
-                    Some(end) => {
-                        let cut = end + close.len();
-                        rest = &rest[cut..];
-                        low = &low[cut..];
-                    }
-                    None => return out,
-                }
-                skipped = true;
-                break;
+        for tag in ["script", "style", "noscript", "svg"] {
+            if !opens_element(low, tag) {
+                continue;
             }
+            let close = format!("</{tag}>");
+            let open_end = low.find('>').map_or(low.len(), |gt| gt + 1);
+            let cut = match low.find(&close) {
+                Some(end) => {
+                    // JSON-LD is data, not code: a schema.org block states a
+                    // page's organisation name, official URL, address, email
+                    // and phone — the very facts this tool is asked for, and
+                    // often stated nowhere in the visible prose. The old leak
+                    // let it through by accident along with the stylesheets;
+                    // dropping all scripts cost it: "the official website of
+                    // Mondragon Corporation" lost its only support, the
+                    // homepage's Organization block (0.84 -> 0.27, measured
+                    // 2026-09-24). It is kept, compacted and size-bounded.
+                    if tag == "script" && low[..open_end].contains("ld+json") {
+                        emit_json_ld(&rest[open_end..end], &mut out);
+                    }
+                    end + close.len()
+                }
+                // No closing tag: drop just this element's opening tag and
+                // read on. Returning here would discard the rest of the page
+                // for one malformed block.
+                None => open_end,
+            };
+            rest = &rest[cut..];
+            low = &low[cut..];
+            skipped = true;
+            break;
         }
         if skipped {
             continue;
@@ -1349,8 +1377,14 @@ fn strip_tags(html: &str) -> String {
                 out.push_str(rest);
                 return out;
             }
-            Some(lt) => {
+            // Text before the next tag: emit it, then come back round so the
+            // skip check above sees the tag itself.
+            Some(lt) if lt > 0 => {
                 out.push_str(&rest[..lt]);
+                rest = &rest[lt..];
+                low = &low[lt..];
+            }
+            Some(lt) => {
                 let tail = &low[lt..];
                 if [
                     "<p", "<br", "<div", "<li", "<tr", "<h", "</p", "</div", "</li", "</tr",
@@ -1404,6 +1438,39 @@ fn strip_tags(html: &str) -> String {
             }
         }
     }
+}
+
+/// Emit a JSON-LD block as one compact line of text: whitespace collapsed,
+/// JSON's escaped slashes restored so URLs read as URLs, and bounded — an
+/// article's structured data can repeat its whole body, which the prose
+/// already carries.
+fn emit_json_ld(raw: &str, out: &mut String) {
+    const MAX_JSON_LD: usize = 2_000;
+    let compact: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = compact.replace("\\/", "/");
+    if compact.is_empty() {
+        return;
+    }
+    let cut = compact
+        .char_indices()
+        .nth(MAX_JSON_LD)
+        .map_or(compact.len(), |(i, _)| i);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&compact[..cut]);
+    out.push('\n');
+}
+
+/// Does `low` (lowercased markup) start with an opening `<tag` for exactly
+/// this element? The name must end at whitespace, `>` or `/`: a bare prefix
+/// test reads `<header>` as `<head`, and with the skip working that would
+/// search for a `</head>` that closed long before and drop the page body.
+fn opens_element(low: &str, tag: &str) -> bool {
+    low.strip_prefix('<')
+        .and_then(|r| r.strip_prefix(tag))
+        .and_then(|r| r.chars().next())
+        .is_some_and(|c| c.is_ascii_whitespace() || c == '>' || c == '/')
 }
 
 /// The named HTML entities that actually appear in body text, as
@@ -3258,6 +3325,92 @@ mod tests {
         assert!(!text.contains("var x"), "script contents must be dropped");
         assert!(!text.contains('<'), "markup must be gone");
         assert_eq!(extract_title(html), "Café » Paris");
+    }
+
+    /// The measured leak: a `<style>` or `<script>` block preceded by any text
+    /// — a newline is enough — came through as page text. Real markup nearly
+    /// always has that newline; the old fixture above only passed because it
+    /// wrote `</p><script>` with nothing between.
+    #[test]
+    fn code_blocks_are_dropped_even_after_text() {
+        let html = "<html>\n<head>\n<title>About Sid</title>\n\
+                    <style>:root{--wp--preset--color:#000}</style>\n</head>\n<body>\n\
+                    <p>Sid Sijbrandij co-founded GitLab.</p>\n\
+                    <script>window.__DATA__ = {\"x\": 1};</script>\n\
+                    <noscript>enable js</noscript>\n\
+                    <svg><path d=\"M0 0L10 10\"/></svg>\n\
+                    <p>He served as CEO from 2012 to 2024.</p>\n</body></html>";
+        let text = html_to_text(html);
+        assert!(
+            text.contains("Sid Sijbrandij co-founded GitLab."),
+            "{text:?}"
+        );
+        assert!(text.contains("CEO from 2012 to 2024"), "{text:?}");
+        for junk in [
+            "--wp--preset",
+            "__DATA__",
+            "enable js",
+            "M0 0L10",
+            "<title>",
+        ] {
+            assert!(!text.contains(junk), "{junk} leaked into {text:?}");
+        }
+    }
+
+    /// Structured data is content: a schema.org block is often the only place
+    /// a homepage states its own official URL, and it was the sole support for
+    /// "the official website of Mondragon Corporation". Code around it goes.
+    #[test]
+    fn json_ld_structured_data_is_kept_as_text() {
+        let html = "<html>\n<head>\n<script>var tracker = 1;</script>\n\
+                    <script type=\"application/ld+json\">\n{\"@type\": \"Organization\",\n\
+                    \"name\": \"MONDRAGON CORPORATION\",\n\
+                    \"url\": \"https:\\/\\/www.mondragon-corporation.com\\/en\\/\"}\n</script>\n\
+                    </head>\n<body>\n<p>Humanity at work.</p>\n</body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("MONDRAGON CORPORATION"), "{text:?}");
+        assert!(
+            text.contains("https://www.mondragon-corporation.com/en/"),
+            "escaped slashes restored: {text:?}"
+        );
+        assert!(text.contains("Humanity at work."), "{text:?}");
+        assert!(
+            !text.contains("tracker"),
+            "an ordinary script still goes: {text:?}"
+        );
+
+        // Bounded: an article's structured data can repeat its whole body.
+        let long = format!(
+            "<script type=\"application/ld+json\">{{\"articleBody\": \"{}\"}}</script>",
+            "word ".repeat(5_000)
+        );
+        let text = html_to_text(&long);
+        assert!(
+            text.len() < 2_100,
+            "json-ld not bounded: {} chars",
+            text.len()
+        );
+    }
+
+    /// With the skip working, a prefix test would read `<header>` as `<head`,
+    /// look for a `</head>` that closed earlier, and drop the page body.
+    #[test]
+    fn a_header_element_is_not_the_head() {
+        let html = "<html><head><title>t</title></head>\n<body>\n\
+                    <header>Site navigation</header>\n<p>The article itself.</p></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Site navigation"), "{text:?}");
+        assert!(text.contains("The article itself."), "{text:?}");
+    }
+
+    /// A code block with no closing tag costs that element, not the rest of
+    /// the page.
+    #[test]
+    fn an_unclosed_code_block_does_not_truncate_the_page() {
+        let html = "<p>Before.</p>\n<script src=\"a.js\">\n<p>After the broken script.</p>";
+        let text = html_to_text(html);
+        assert!(text.contains("Before."), "{text:?}");
+        assert!(text.contains("After the broken script."), "{text:?}");
     }
 
     #[test]

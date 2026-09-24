@@ -6337,10 +6337,21 @@ impl Scout {
         let packs_len = packs.len();
         let extracted: Vec<ExtractedPack> = stream::iter(packs)
             .map(|p| async move {
-                let candidates = match self
+                let started = Instant::now();
+                let result = self
                     .timed("7 extract", self.extract_records(mission, &p.text))
-                    .await
-                {
+                    .await;
+                // Per-call duration beside pack size and yield: a round waits
+                // for its slowest extraction, and that call's size is what
+                // packing controls (see PACK_CAP).
+                tracing::debug!(
+                    chars = p.text.len(),
+                    chunks = p.chunks.len(),
+                    records = result.as_ref().map_or(0, |r| r.len()),
+                    ms = started.elapsed().as_millis() as u64,
+                    "extract pack"
+                );
+                let candidates = match result {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::debug!(error = %e, "extraction failed");
