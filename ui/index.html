@@ -4,24 +4,70 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#ffffff" />
     <meta name="description" content="Search the web and get verified, grounded results." />
     <title>webscout</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='14' cy='14' r='8' fill='none' stroke='%231a73e8' stroke-width='3'/%3E%3Cpath d='M20 20l7 7' stroke='%231a73e8' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='16' fill='%234285F4'/%3E%3Ctext x='16' y='22.5' font-family='Arial' font-size='19' font-weight='700' fill='white' text-anchor='middle'%3Ew%3C/text%3E%3C/svg%3E" />
   </head>
-  <body>
-    <div id="app" class="app" data-phase="idle">
+  <body data-boot="checking">
+    <!-- Shown instead of the app when the server has a password and there is no
+         session. Not a browser prompt: the page itself asks, and after logging in
+         the person is put back where they were. -->
+    <main class="login" id="login" hidden aria-labelledby="login-title">
+      <div class="login__card">
+        <div class="login__logo wordmark wordmark--small" aria-hidden="true">
+          <span>w</span><span>e</span><span>b</span><span>s</span><span>c</span><span>o</span><span>u</span><span>t</span>
+        </div>
+        <h1 class="login__title" id="login-title">Sign in</h1>
+        <p class="login__intro">This webscout server is private. Enter its password to continue.</p>
+
+        <form class="login__form" id="login-form" novalidate>
+          <div class="login__field">
+            <input class="login__input" id="login-password" name="password" type="password" autocomplete="current-password" placeholder=" " spellcheck="false" autocapitalize="off" required aria-describedby="login-error" />
+            <label class="login__label" for="login-password">Enter the password</label>
+          </div>
+          <p class="login__error" id="login-error" role="alert" aria-live="assertive"></p>
+          <label class="login__show">
+            <input type="checkbox" id="login-eye" aria-controls="login-password" />
+            <span>Show password</span>
+          </label>
+          <div class="login__actions">
+            <button type="submit" class="btn btn--primary login__submit" id="login-submit">
+              <span class="login__spinner" aria-hidden="true"></span>
+              <span class="login__submit-text" id="login-submit-text">Log in</span>
+            </button>
+          </div>
+        </form>
+      </div>
+      <p class="login__tagline">Searches the web. Returns only what it can verify.</p>
+    </main>
+
+    <div id="app" class="app" data-phase="idle" data-view="search" data-layout="hero" data-tools="closed">
       <header class="masthead" id="masthead">
         <div class="masthead__inner">
-          <a class="brand" href="./" id="brand" aria-label="webscout home">
-            <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
-              <circle cx="14" cy="14" r="8.5" fill="none" stroke="currentColor" stroke-width="2.6" />
-              <path d="M20.5 20.5 L27 27" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" />
-            </svg>
-            <span class="brand__name">webscout</span>
-          </a>
-          <p class="brand__tagline">Searches the web. Returns only what it can verify.</p>
+          <!-- Top-right actions. On the home page they read as Google's text links;
+               in the results header they fold into round icon buttons. -->
+          <nav class="topbar" aria-label="Account and tools">
+            <a class="topbar__link" href="#stats" id="stats-link" data-view-link="stats">Statistics</a>
+            <button type="button" class="topbar__btn" id="help-open" aria-haspopup="dialog" title="Examples &amp; help">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9.6 9.3a2.5 2.5 0 1 1 3.4 2.3c-.6.3-1 .8-1 1.5v.4M12 16.6v.1" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
+              <span class="topbar__text">Examples &amp; help</span>
+            </button>
+            <button type="button" class="topbar__btn" id="connect-open" aria-haspopup="dialog" title="Connect AI tools">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7zM12 16v5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span class="topbar__text">Connect AI tools</span>
+            </button>
+            <button type="button" class="topbar__avatar" id="logout" hidden title="Log out">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span class="sr-only">Log out</span>
+            </button>
+          </nav>
 
-          <form class="search" id="search-form" autocomplete="off">
+          <a class="brand" href="./" id="brand" aria-label="webscout home">
+            <span class="wordmark" aria-hidden="true"><span>w</span><span>e</span><span>b</span><span>s</span><span>c</span><span>o</span><span>u</span><span>t</span></span>
+          </a>
+
+          <form class="search" id="search-form" autocomplete="off" role="search">
             <div class="search__field">
               <svg class="search__icon" viewBox="0 0 24 24" aria-hidden="true">
                 <circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2" />
@@ -40,27 +86,31 @@
               <button type="button" class="search__clear" id="clear-query" aria-label="Clear query" hidden>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
               </button>
-              <button type="submit" class="btn btn--primary search__submit" id="submit">Search</button>
-              <button type="button" class="btn btn--stop search__stop" id="stop" hidden>Stop</button>
+              <span class="search__divider" aria-hidden="true"></span>
+              <button type="submit" class="search__go" id="submit" aria-label="Search" title="Search">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2.2" /><path d="M15.5 15.5 L21 21" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" /></svg>
+              </button>
+              <button type="button" class="search__stop" id="stop" hidden aria-label="Stop the search" title="Stop">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5" fill="currentColor" /></svg>
+                <span class="search__stop-text">Stop</span>
+              </button>
             </div>
 
-            <div class="controls" aria-label="Search options">
+            <!-- Home page only: Google's pair of grey buttons under the field. -->
+            <div class="search__buttons">
+              <button type="submit" class="gbtn" id="search-btn">webscout Search</button>
+              <button type="button" class="gbtn" id="lucky" title="Run a random example question">Surprise me</button>
+            </div>
+
+            <div class="controls" id="controls" aria-label="Search options">
               <div class="controls__chips" id="basic-controls"></div>
-              <button type="button" class="chip chip--help" id="help-open" aria-haspopup="dialog">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9.6 9.3a2.5 2.5 0 1 1 3.4 2.3c-.6.3-1 .8-1 1.5v.4M12 16.6v.1" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
-                Examples &amp; help
-              </button>
-              <button type="button" class="chip chip--help" id="connect-open" aria-haspopup="dialog">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7zM12 16v5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                Connect AI tools
-              </button>
             </div>
 
             <details class="advanced" id="advanced">
               <summary class="advanced__summary">
-                <svg class="advanced__chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 <span>More options</span>
                 <span class="advanced__count" id="changed-count" hidden></span>
+                <svg class="advanced__chevron" viewBox="5 8 14 8" aria-hidden="true"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
               </summary>
               <div class="advanced__body">
                 <div class="advanced__grid" id="advanced-controls"></div>
@@ -70,11 +120,29 @@
               </div>
             </details>
           </form>
+
+          <!-- Results header only: Google's "All · Images · News … Tools" row. -->
+          <div class="tabs-row">
+            <div class="tabs" role="tablist" aria-label="Views" id="tabs">
+              <button type="button" class="tabs__tab" role="tab" id="tab-search" data-view="search" aria-controls="view-search" aria-selected="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M15 15l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                <span>Search</span>
+              </button>
+              <button type="button" class="tabs__tab" role="tab" id="tab-stats" data-view="stats" aria-controls="view-stats" aria-selected="false" tabindex="-1">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V11M12 20V5M19 20v-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+                <span>Statistics</span>
+              </button>
+            </div>
+            <button type="button" class="tabs__tools" id="tools-toggle" aria-expanded="false" aria-controls="controls">
+              <span>Tools</span>
+              <span class="tabs__dot" id="tools-dot" hidden aria-hidden="true"></span>
+            </button>
+          </div>
         </div>
       </header>
 
       <main class="main" id="main">
-        <div class="stack" id="stack">
+        <div class="stack" id="view-search" role="tabpanel" aria-labelledby="tab-search">
           <section class="panel panel--error" id="error-panel" hidden role="alert" aria-live="assertive">
             <div class="panel__row">
               <svg class="panel__icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7.5v5.5M12 16.2v.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
@@ -90,10 +158,10 @@
             <div class="activity__head">
               <span class="activity__pulse" id="activity-pulse" aria-hidden="true"></span>
               <span class="activity__status" id="activity-status">Starting…</span>
-              <span class="activity__spacer"></span>
               <span class="activity__timer" id="timer">0.0s</span>
-              <button type="button" class="btn btn--text activity__toggle" id="usage-toggle" aria-expanded="false" aria-controls="usage">Show tokens &amp; cost</button>
-              <button type="button" class="btn btn--text activity__toggle" id="activity-toggle" aria-expanded="true">Hide log</button>
+              <span class="activity__spacer"></span>
+              <button type="button" class="linkbtn activity__toggle" id="usage-toggle" aria-expanded="false" aria-controls="usage">Show tokens &amp; cost</button>
+              <button type="button" class="linkbtn activity__toggle" id="activity-toggle" aria-expanded="true">Hide log</button>
             </div>
             <ol class="activity__list" id="activity-list"></ol>
           </section>
@@ -113,29 +181,34 @@
 
           <section class="reply" id="result" hidden aria-label="Result">
             <div class="reply__head">
+              <span class="reply__badge" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 2.5l2.4 1.8 3-.1.9 2.8 2.4 1.8-.9 2.8.9 2.8-2.4 1.8-.9 2.8-3-.1L12 21.5l-2.4-1.8-3 .1-.9-2.8-2.4-1.8.9-2.8-.9-2.8 2.4-1.8.9-2.8 3 .1z" fill="currentColor"/><path d="M8.3 12.2l2.5 2.5 5-5" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+              <span class="reply__label">Verified answer</span>
               <span class="outcome" id="outcome" data-outcome="">—</span>
-              <span class="reply__summary" id="summary"></span>
               <div class="result__actions">
-                <button type="button" class="btn btn--tonal btn--small" id="copy">Copy</button>
+                <button type="button" class="iconbtn" id="copy" title="Copy" aria-label="Copy the result">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.9"/><path d="M5.5 15.5V5.5a2 2 0 0 1 2-2h8" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+                </button>
                 <div class="menu" id="download-menu">
-                  <button type="button" class="btn btn--tonal btn--small menu__trigger" id="download-trigger" aria-haspopup="true" aria-expanded="false">
-                    Download
-                    <svg viewBox="0 0 24 24" aria-hidden="true" class="menu__caret"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <button type="button" class="iconbtn menu__trigger" id="download-trigger" aria-haspopup="true" aria-expanded="false" title="Download" aria-label="Download">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
                   </button>
                   <div class="menu__list" id="download-list" role="menu" hidden></div>
                 </div>
               </div>
             </div>
+            <p class="reply__summary" id="summary"></p>
             <article class="prose reply__body" id="prose"></article>
             <ul class="notes" id="notes" hidden></ul>
             <div class="reply__foot">
-              <button type="button" class="btn btn--text" id="sources-toggle" aria-expanded="false" aria-controls="sources" hidden>Show sources</button>
+              <button type="button" class="pillbtn" id="sources-toggle" aria-expanded="false" aria-controls="sources" hidden>Show sources</button>
               <span class="reply__took" id="took"></span>
             </div>
           </section>
 
-          <section class="sources" id="sources" hidden aria-label="Sources">
-            <h2 class="sources__title">Sources</h2>
+          <section class="sources" id="sources" hidden aria-labelledby="sources-title">
+            <h2 class="sources__title" id="sources-title">Sources</h2>
             <p class="sources__intro">The pages the answer was checked against. Numbers match the citations in the answer.</p>
             <ol class="sources__list" id="sources-list"></ol>
             <div class="sources__quarantine" id="quarantine" hidden>
@@ -144,7 +217,24 @@
             </div>
           </section>
         </div>
+
+        <!-- Filled by src/stats.js the first time the tab is opened. -->
+        <section class="view-stats" id="view-stats" role="tabpanel" aria-labelledby="tab-stats" hidden></section>
       </main>
+
+      <!-- Home page only, like Google's grey footer. -->
+      <footer class="footer" id="footer">
+        <div class="footer__top">Searches the web. Returns only what it can verify.</div>
+        <div class="footer__bottom">
+          <div class="footer__links">
+            <button type="button" class="footer__link" data-open="help">Examples</button>
+            <button type="button" class="footer__link" data-open="connect">Connect AI tools</button>
+          </div>
+          <div class="footer__links">
+            <a class="footer__link" href="#stats" data-view-link="stats">Statistics</a>
+          </div>
+        </div>
+      </footer>
 
       <dialog class="help" id="help" aria-labelledby="help-title">
         <div class="help__head">
@@ -153,10 +243,12 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
           </button>
         </div>
-        <p class="help__intro">webscout searches the web, reads the pages, and returns only what it could check against them. Pick an example to put it in the search box, change it if you like, then press Search.</p>
-        <div class="help__groups" id="help-groups"></div>
-        <h3 class="help__subtitle">Good to know</h3>
-        <ul class="help__tips" id="help-tips"></ul>
+        <div class="help__body">
+          <p class="help__intro">webscout searches the web, reads the pages, and returns only what it could check against them. Pick an example to put it in the search box, change it if you like, then press Enter.</p>
+          <div class="help__groups" id="help-groups"></div>
+          <h3 class="help__subtitle">Good to know</h3>
+          <ul class="help__tips" id="help-tips"></ul>
+        </div>
       </dialog>
 
       <dialog class="help connect" id="connect" aria-labelledby="connect-title">
@@ -166,25 +258,39 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
           </button>
         </div>
-        <p class="help__intro">webscout is also an MCP server, so Claude Code, opencode, pi and other AI assistants can run searches themselves and read the verified results.</p>
+        <div class="help__body">
+          <p class="help__intro">webscout is also an MCP server, so Claude Code, opencode, pi and other AI assistants can run searches themselves and read the verified results.</p>
 
-        <div class="connect__status" id="connect-status" data-state="unknown"></div>
+          <div class="connect__status" id="connect-status" data-state="unknown"></div>
 
-        <label class="connect__label" for="connect-url">Server address</label>
-        <div class="connect__row">
-          <input class="field__input connect__url" id="connect-url" readonly />
-          <button type="button" class="btn btn--tonal btn--small" data-copy-target="connect-url">Copy</button>
+          <label class="connect__label" for="connect-url">Server address</label>
+          <div class="connect__row">
+            <input class="field__input connect__url" id="connect-url" readonly />
+            <button type="button" class="btn btn--tonal btn--small" data-copy-target="connect-url">Copy</button>
+          </div>
+
+          <label class="connect__label" for="connect-token">Access token</label>
+          <!-- Open server: the token is not sent to the page; pasting it fills the examples. -->
+          <div id="connect-token-paste">
+            <input class="field__input" id="connect-token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste it here to fill in the examples below (optional)" />
+            <p class="field__help">Every client must send the token. It is the value of <code>WEBSCOUT_MCP_TOKEN</code> in the server's <code>.env</code> file; ask whoever runs this server. What you paste here stays in this page and is not saved.</p>
+          </div>
+          <!-- Password-protected server, logged in: the server hands over its token. -->
+          <div id="connect-token-server" hidden>
+            <div class="connect__row">
+              <input class="field__input connect__secret" id="connect-token-value" type="password" readonly autocomplete="off" spellcheck="false" aria-describedby="connect-token-help" />
+              <button type="button" class="btn btn--tonal btn--small connect__reveal" id="connect-token-reveal" aria-pressed="false" aria-controls="connect-token-value">Reveal</button>
+              <button type="button" class="btn btn--tonal btn--small" id="connect-token-copy">Copy</button>
+            </div>
+            <p class="field__help" id="connect-token-help">This is this server's token, already filled into the examples below (hidden until you press Reveal; Copy always copies the real value). Keep it secret: anyone who has it can run searches on this server.</p>
+          </div>
+
+          <div class="connect__tabs" role="tablist" id="connect-tabs"></div>
+          <div class="connect__panel" id="connect-panel" role="tabpanel"></div>
+
+          <h3 class="help__subtitle">What your assistant gets</h3>
+          <ul class="help__tips" id="connect-tools"></ul>
         </div>
-
-        <label class="connect__label" for="connect-token">Access token</label>
-        <input class="field__input" id="connect-token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste it here to fill in the examples below (optional)" />
-        <p class="field__help">Every client must send the token. It is the value of <code>WEBSCOUT_MCP_TOKEN</code> in the server's <code>.env</code> file; ask whoever runs this server. What you paste here stays in this page and is not saved.</p>
-
-        <div class="connect__tabs" role="tablist" id="connect-tabs"></div>
-        <div class="connect__panel" id="connect-panel" role="tabpanel"></div>
-
-        <h3 class="help__subtitle">What your assistant gets</h3>
-        <ul class="help__tips" id="connect-tools"></ul>
       </dialog>
 
       <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

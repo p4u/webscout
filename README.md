@@ -27,7 +27,7 @@ MCP server and the obscura browser in one container (see `Dockerfile`).
 docker run --rm -p 8080:8080 \
   -e TYPESAFE_API_KEY=... \
   -e WEBSCOUT_LLM_API_KEY=... \
-  -e WEBSCOUT_AUTH=admin:choose-a-password \
+  -e WEBSCOUT_PASSWORD=choose-a-password \
   -e WEBSCOUT_MCP_TOKEN=$(openssl rand -hex 24) \
   ghcr.io/p4u/webscout:latest
 # UI: http://localhost:8080    MCP: http://localhost:8080/mcp
@@ -39,7 +39,8 @@ docker run --rm -p 8080:8080 \
 | `WEBSCOUT_LLM_API_KEY` | yes | the writer model's key (OpenRouter by default) |
 | `WEBSCOUT_LLM_ENDPOINT`, `WEBSCOUT_LLM_MODEL` | no | another OpenAI-compatible endpoint or model; the endpoint is the full `/chat/completions` URL |
 | `WEBSCOUT_PLANNER_MODEL` | no | a separate model for planning |
-| `WEBSCOUT_AUTH` | on any public host | `user:password` login for the UI and `/api` (HTTP Basic). Searches are billed to your keys: without it, anyone who finds the URL can run them |
+| `WEBSCOUT_PASSWORD` | on any public host | password for the web UI and `/api` (a login page, then a 30-day session cookie; failed attempts are rate-limited). Searches are billed to your keys: without it, anyone who finds the URL can run them. Logged in, the UI also shows the MCP token |
+| `WEBSCOUT_DATA_DIR` | no | where the run log behind the Statistics tab is kept (`runs.jsonl`; `/data` in the image — mount a volume there) |
 | `WEBSCOUT_MCP_TOKEN` | to enable MCP | bearer token every MCP client must send; unset disables `/mcp` |
 | `WEBSCOUT_MCP_MAX_RUNNING` | no | MCP searches allowed at once (default 4) |
 | `JINA_API_KEY` | no | adds Jina's hosted search and reader (metered) |
@@ -47,10 +48,20 @@ docker run --rm -p 8080:8080 \
 
 `/api/health` stays open for health checks.
 
+### Statistics
+
+The **Statistics** tab shows how the service is used and what it costs: searches over
+time by outcome (hour / day / week buckets), success rate, spend per actor (Jev,
+writer, planner) and over time, median and p90 duration, answers vs lists, UI vs MCP,
+and the latest searches. Every search — from the UI or an MCP client, finished,
+failed or cancelled — is appended to `runs.jsonl` in `WEBSCOUT_DATA_DIR`, and
+`GET /api/stats?bucket=hour|day|week&days=N` aggregates it.
+
 ### Railway, DigitalOcean
 
 Create a service from the image `ghcr.io/p4u/webscout:latest`, set the variables above,
-and expose port 8080 over HTTP. On Railway that is *New project → Docker image*;
+and expose port 8080 over HTTP. Mount a volume at `/data` so the statistics survive
+redeploys (on Railway also set `RAILWAY_RUN_UID=0`, since its volumes mount owned by root). On Railway that is *New project → Docker image*;
 on DigitalOcean App Platform, *Create app → Container image → GHCR*. Both can also
 build straight from this repository, using the root `Dockerfile`. The search cache
 lives in `/cache`; mount a volume there to keep it across restarts (optional).

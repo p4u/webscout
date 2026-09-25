@@ -1,9 +1,19 @@
 import './styles.css';
-import { ApiError, downloadUrl, fetchOptions, streamSearch } from './api.js';
+import {
+  ApiError,
+  downloadUrl,
+  fetchMcpInfo,
+  fetchOptions,
+  fetchSession,
+  login as apiLogin,
+  logout as apiLogout,
+  streamSearch,
+} from './api.js';
 import { createControls } from './options.js';
 import { renderMarkdown, renderPlain, wrapTables } from './markdown.js';
 import { EXAMPLE_GROUPS, TIPS } from './examples.js';
-import { CLIENTS, TOOL_NOTES, mcpUrl, tokenOrPlaceholder } from './connect.js';
+import { CLIENTS, TOOL_NOTES, maskedToken, mcpUrl, tokenOrPlaceholder } from './connect.js';
+import { mountStats } from './stats.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -13,7 +23,11 @@ const el = {
   query: $('query'),
   clearQuery: $('clear-query'),
   submit: $('submit'),
+  searchBtn: $('search-btn'),
+  lucky: $('lucky'),
   stop: $('stop'),
+  toolsToggle: $('tools-toggle'),
+  toolsDot: $('tools-dot'),
   basic: $('basic-controls'),
   advancedDetails: $('advanced'),
   advanced: $('advanced-controls'),
@@ -62,6 +76,11 @@ const el = {
   connectStatus: $('connect-status'),
   connectUrl: $('connect-url'),
   connectToken: $('connect-token'),
+  connectTokenPaste: $('connect-token-paste'),
+  connectTokenServer: $('connect-token-server'),
+  connectTokenValue: $('connect-token-value'),
+  connectTokenReveal: $('connect-token-reveal'),
+  connectTokenCopy: $('connect-token-copy'),
   connectTabs: $('connect-tabs'),
   connectPanel: $('connect-panel'),
   connectTools: $('connect-tools'),
@@ -70,7 +89,24 @@ const el = {
   downloadList: $('download-list'),
 
   toast: $('toast'),
+
+  tabs: $('tabs'),
+  tabButtons: [$('tab-search'), $('tab-stats')],
+  viewSearch: $('view-search'),
+  viewStats: $('view-stats'),
+  logout: $('logout'),
+
+  login: $('login'),
+  loginForm: $('login-form'),
+  loginPassword: $('login-password'),
+  loginEye: $('login-eye'),
+  loginError: $('login-error'),
+  loginSubmit: $('login-submit'),
+  loginSubmitText: $('login-submit-text'),
 };
+
+const SEARCH_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M15.5 15.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
 
 const DOWNLOAD_FORMATS = [
   { format: 'markdown', label: 'Markdown', ext: '.md' },
@@ -96,6 +132,25 @@ const state = {
   showUsage: readPref('webscout.showUsage'),
   // Which client's setup the "Connect AI tools" dialog shows.
   connectClient: 'claude',
+  // The server's MCP token, when a password-protected server hands it to a
+  // logged-in person. Memory only: never stored, never logged, dropped on logout.
+  mcpToken: null,
+  tokenRevealed: false,
+
+  // Which tab is showing: 'search' or 'stats' (mirrored in the URL hash).
+  view: 'search',
+  // The statistics view, mounted the first time its tab is opened.
+  statsView: null,
+  // A ?q= search that arrived while the Statistics tab was showing; it runs
+  // when Search is first shown rather than spending money out of sight.
+  pendingQuery: '',
+
+  // Login. `loginPromise` is pending while the card is up; everything that hit a
+  // 401 awaits it and then carries on where it was.
+  authRequired: false,
+  loginPromise: null,
+  loginResolve: null,
+  loggingIn: false,
   // Incremented on every run. A late event from a superseded run is ignored rather
   // than allowed to overwrite the current one.
   token: 0,
@@ -107,9 +162,21 @@ init();
 
 async function init() {
   wireStaticHandlers();
+  wireLogin();
+  wireTabs();
   renderHelp();
   renderConnect();
   applyUsageVisibility();
+
+  // A private server shows the login card before anything else. An older
+  // server without /api/session reads as open (see fetchSession).
+  const session = await fetchSession();
+  state.authRequired = session.auth_required;
+  el.logout.hidden = !state.authRequired;
+  document.body.dataset.boot = 'ready';
+  if (session.auth_required && !session.authenticated) await requireLogin();
+
+  applyView(viewFromHash());
   await loadOptions();
 
   // ?q=... makes a search linkable and re-runnable.
@@ -117,10 +184,11 @@ async function init() {
   if (initial && initial.trim()) {
     el.query.value = initial;
     el.clearQuery.hidden = false;
-    void run(initial);
+    if (state.view === 'search') void run(initial);
+    else state.pendingQuery = initial;
     return;
   }
-  el.query.focus();
+  if (state.view === 'search') el.query.focus();
 }
 
 async function loadOptions() {
@@ -132,6 +200,10 @@ async function loadOptions() {
     updateChangedCount();
     clearError();
   } catch (err) {
+    if (isLoginRequired(err)) {
+      await requireLogin();
+      return loadOptions();
+    }
     // A missing control surface must not leave a blank screen: the query field
     // still works, and retry re-fetches the schema.
     showError('Could not load search options', messageOf(err), () => loadOptions());
@@ -148,6 +220,37 @@ function wireStaticHandlers() {
   };
   applyPlaceholder();
   narrow.addEventListener('change', applyPlaceholder);
+
+  // "Surprise me": Google's "I'm Feeling Lucky" — a random known-good example,
+  // run straight away.
+  el.lucky.addEventListener('click', () => {
+    if (state.running) return;
+    const all = EXAMPLE_GROUPS.flatMap((g) => g.examples);
+    const pick = all[Math.floor(Math.random() * all.length)];
+    el.query.value = pick;
+    el.clearQuery.hidden = false;
+    void run(pick);
+  });
+
+  // "Tools" in the results header shows or hides the search options row.
+  el.toolsToggle.addEventListener('click', () => {
+    setToolsOpen(el.app.dataset.tools !== 'open');
+  });
+
+  // Footer and top-bar shortcuts: open a dialog, or switch to a view.
+  document.addEventListener('click', (event) => {
+    const opener = event.target.closest?.('[data-open]');
+    if (opener) {
+      if (opener.dataset.open === 'help') openHelp();
+      else if (opener.dataset.open === 'connect') void openConnect();
+      return;
+    }
+    const viewLink = event.target.closest?.('[data-view-link]');
+    if (viewLink) {
+      event.preventDefault();
+      selectView(viewLink.dataset.viewLink);
+    }
+  });
 
   el.form.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -182,9 +285,9 @@ function wireStaticHandlers() {
   });
 
   el.brand.addEventListener('click', (event) => {
-    if (state.running) return;
     event.preventDefault();
-    resetToIdle();
+    if (state.view !== 'search') selectView('search');
+    if (!state.running) resetToIdle();
   });
 
   el.activityToggle.addEventListener('click', () => {
@@ -222,10 +325,25 @@ function wireStaticHandlers() {
     if (event.target === el.connect) el.connect.close();
     const copy = event.target.closest?.('[data-copy-target]');
     if (copy) void copyText(document.getElementById(copy.dataset.copyTarget)?.value ?? '');
-    const copyCode = event.target.closest?.('[data-copy-code]');
-    if (copyCode) void copyText(copyCode.parentElement.querySelector('code')?.textContent ?? '');
+    // Built afresh rather than read off the screen: a masked server token must
+    // still reach the clipboard as the real value.
+    const copyStep = event.target.closest?.('[data-copy-step]');
+    if (copyStep) void copyText(snippetText(Number(copyStep.dataset.copyStep), realToken()));
+  });
+  el.connect.addEventListener('close', () => {
+    state.tokenRevealed = false;
+    applyTokenUi();
+    renderConnectPanel();
   });
   el.connectToken.addEventListener('input', () => renderConnectPanel());
+  el.connectTokenReveal.addEventListener('click', () => {
+    state.tokenRevealed = !state.tokenRevealed;
+    applyTokenUi();
+    renderConnectPanel();
+  });
+  el.connectTokenCopy.addEventListener('click', () => {
+    if (state.mcpToken) void copyText(state.mcpToken);
+  });
   el.helpClose.addEventListener('click', () => el.help.close());
   // A click on the backdrop (outside the dialog box) closes it.
   el.help.addEventListener('click', (event) => {
@@ -255,6 +373,14 @@ function updateChangedCount() {
   const n = state.controls?.changedCount() ?? 0;
   el.changedCount.hidden = n === 0;
   el.changedCount.textContent = String(n);
+  // The results header keeps the options behind "Tools"; a dot there says
+  // something differs from the defaults.
+  el.toolsDot.hidden = n === 0;
+}
+
+function setToolsOpen(open) {
+  el.app.dataset.tools = open ? 'open' : 'closed';
+  el.toolsToggle.setAttribute('aria-expanded', String(open));
 }
 
 // ----------------------------------------------------------------- the run
@@ -271,7 +397,7 @@ async function run(rawQuery) {
   hideResult();
   state.lastQuery = query;
   try {
-    history.replaceState(null, '', `?q=${encodeURIComponent(query)}`);
+    history.replaceState(null, '', `?q=${encodeURIComponent(query)}${location.hash}`);
   } catch {
     /* file:// or a sandboxed frame — the URL is cosmetic */
   }
@@ -280,6 +406,7 @@ async function run(rawQuery) {
   state.lastFormat = String(state.controls?.get('format') ?? 'markdown');
 
   setPhase('running');
+  setToolsOpen(false);
   startTimer();
   el.activity.hidden = false;
   el.activity.dataset.live = 'true';
@@ -298,6 +425,7 @@ async function run(rawQuery) {
   setRunning(true);
 
   let sawTerminal = false;
+  let loginNeeded = false;
 
   try {
     for await (const event of streamSearch({ query, options, signal: controller.signal })) {
@@ -341,6 +469,11 @@ async function run(rawQuery) {
     if (err?.name === 'AbortError') {
       setStatus('Stopped');
       logLine('stopped', 'Run stopped by you.');
+    } else if (isLoginRequired(err)) {
+      // The session ran out. Nothing ran server-side; log in and go again.
+      loginNeeded = true;
+      setStatus('Log in to continue');
+      logLine('login', 'The session has expired. Log in and the search starts again.');
     } else {
       setStatus('Failed');
       logLine('error', messageOf(err));
@@ -348,6 +481,11 @@ async function run(rawQuery) {
     }
   } finally {
     if (current()) finishRun();
+  }
+
+  if (loginNeeded) {
+    await requireLogin();
+    if (current() && !state.running) void run(query);
   }
 }
 
@@ -624,6 +762,37 @@ function supportLabel(p) {
   return ['weak', 'Weak support'];
 }
 
+/** "https://www.vodafone.com/about/who" → ["vodafone.com", "https://www.vodafone.com › about › who"] */
+function crumbOf(url) {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split('/').filter(Boolean).map((p) => {
+      try {
+        return decodeURIComponent(p);
+      } catch {
+        return p;
+      }
+    });
+    return [`${u.protocol}//${u.host}`, ...parts].join(' › ');
+  } catch {
+    return String(url ?? '');
+  }
+}
+
+/** A site's first letter, for the favicon-like circle. */
+function initialOf(host) {
+  const name = host.replace(/^(www|m|en|es)\./, '');
+  return (name.match(/[a-z0-9]/i)?.[0] ?? '?').toUpperCase();
+}
+
+/** A stable colour per site, so the circles tell sites apart. */
+const FAVICON_COLOURS = ['#4285f4', '#ea4335', '#f9ab00', '#34a853', '#a142f4', '#24c1e0', '#e8710a', '#1a73e8'];
+function colourOf(host) {
+  let h = 0;
+  for (const ch of host) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return FAVICON_COLOURS[h % FAVICON_COLOURS.length];
+}
+
 function renderSources(sources, quarantined) {
   el.sourcesList.replaceChildren();
   el.quarantineList.replaceChildren();
@@ -632,35 +801,57 @@ function renderSources(sources, quarantined) {
     const li = document.createElement('li');
     li.className = 'source';
     li.id = `source-${i + 1}`;
+    const host = hostOf(source.url);
+    const href = safeHref(source.url);
 
+    // Google's result header: favicon, site name, breadcrumb URL.
+    const site = document.createElement('div');
+    site.className = 'source__site';
+    const fav = document.createElement('span');
+    fav.className = 'source__fav';
+    fav.textContent = initialOf(host);
+    fav.style.background = colourOf(host);
+    fav.setAttribute('aria-hidden', 'true');
+    const names = document.createElement('div');
+    names.className = 'source__names';
+    const siteName = document.createElement('span');
+    siteName.className = 'source__host';
+    siteName.textContent = host;
+    const crumb = document.createElement('cite');
+    crumb.className = 'source__crumb';
+    crumb.textContent = crumbOf(source.url);
+    names.append(siteName, crumb);
+    // The citation number rides on the circle, so [n] in the answer and this
+    // result are visibly the same thing.
     const num = document.createElement('span');
     num.className = 'source__num';
     num.textContent = String(i + 1);
+    num.title = `Citation ${i + 1}`;
+    const mark = document.createElement('span');
+    mark.className = 'source__mark';
+    mark.append(fav, num);
+    site.append(mark, names);
 
-    const main = document.createElement('div');
-    main.className = 'source__main';
-    const href = safeHref(source.url);
     const title = document.createElement(href ? 'a' : 'span');
     title.className = 'source__title';
-    title.textContent = (source.title || '').trim() || hostOf(source.url);
+    title.textContent = (source.title || '').trim() || host;
     if (href) {
       title.href = href;
       title.target = '_blank';
       title.rel = 'noopener noreferrer';
     }
-    const host = document.createElement('span');
-    host.className = 'source__host';
-    host.textContent = hostOf(source.url);
-    main.append(title, host);
+    const heading = document.createElement('h3');
+    heading.className = 'source__heading';
+    heading.appendChild(title);
 
-    li.append(num, main);
+    li.append(site, heading);
     const support = supportLabel(source.supports);
     if (support) {
-      const pill = document.createElement('span');
-      pill.className = `source__support source__support--${support[0]}`;
-      pill.textContent = support[1];
-      pill.title = `How strongly this page supports the answer: ${Math.round(Number(source.supports) * 100)}%`;
-      li.appendChild(pill);
+      const meta = document.createElement('p');
+      meta.className = `source__support source__support--${support[0]}`;
+      meta.textContent = `${support[1]} · ${Math.round(Number(source.supports) * 100)}%`;
+      meta.title = 'How strongly this page supports the answer';
+      li.appendChild(meta);
     }
     el.sourcesList.appendChild(li);
   });
@@ -986,6 +1177,17 @@ function hideResult() {
 
 function setPhase(phase) {
   el.app.dataset.phase = phase;
+  updateLayout();
+}
+
+/**
+ * `hero` centres the search under the product name; `compact` is the sticky
+ * header. The Statistics tab always uses the compact header: a centred empty
+ * masthead above a dashboard would push the numbers below the fold.
+ */
+function updateLayout() {
+  const hero = el.app.dataset.phase === 'idle' && state.view === 'search';
+  el.app.dataset.layout = hero ? 'hero' : 'compact';
 }
 
 function resetToIdle() {
@@ -1001,7 +1203,7 @@ function resetToIdle() {
   el.clearQuery.hidden = true;
   setPhase('idle');
   try {
-    history.replaceState(null, '', location.pathname);
+    history.replaceState(null, '', location.pathname + location.hash);
   } catch {
     /* cosmetic */
   }
@@ -1012,6 +1214,8 @@ function setRunning(running) {
   state.running = running;
   el.submit.disabled = running;
   el.submit.hidden = running;
+  el.searchBtn.disabled = running;
+  el.lucky.disabled = running;
   el.stop.hidden = !running;
   el.query.readOnly = running;
   el.reset.disabled = running;
@@ -1106,15 +1310,20 @@ function renderHelp() {
     const blurb = document.createElement('p');
     blurb.className = 'help__blurb';
     blurb.textContent = group.blurb;
-    const list = document.createElement('div');
+    const list = document.createElement('ul');
     list.className = 'help__examples';
     for (const example of group.examples) {
+      const item = document.createElement('li');
       const b = document.createElement('button');
       b.type = 'button';
       b.className = 'help__example';
-      b.textContent = example;
+      b.innerHTML = SEARCH_ICON;
+      const text = document.createElement('span');
+      text.textContent = example;
+      b.appendChild(text);
       b.addEventListener('click', () => useExample(example));
-      list.appendChild(b);
+      item.appendChild(b);
+      list.appendChild(item);
     }
     section.append(h, blurb, list);
     el.helpGroups.appendChild(section);
@@ -1181,9 +1390,13 @@ function renderConnectPanel() {
     tab.classList.toggle('is-active', on);
   }
   const url = mcpUrl();
-  const token = tokenOrPlaceholder(el.connectToken.value);
+  const token = state.mcpToken
+    ? state.tokenRevealed
+      ? state.mcpToken
+      : maskedToken()
+    : tokenOrPlaceholder(el.connectToken.value);
   el.connectPanel.replaceChildren(
-    ...client.steps.map((step) => {
+    ...client.steps.map((step, i) => {
       const wrap = document.createElement('div');
       wrap.className = 'connect__step';
       const p = document.createElement('p');
@@ -1196,7 +1409,7 @@ function renderConnectPanel() {
       const copy = document.createElement('button');
       copy.type = 'button';
       copy.className = 'btn btn--tonal btn--small connect__copy';
-      copy.dataset.copyCode = '';
+      copy.dataset.copyStep = String(i);
       copy.textContent = 'Copy';
       pre.append(code, copy);
       wrap.append(p, pre);
@@ -1205,27 +1418,280 @@ function renderConnectPanel() {
   );
 }
 
-/** Ask the server whether the endpoint is on; the token itself is never sent to the page. */
+/** The token a copied snippet carries: the server's, else what was pasted, else the placeholder. */
+function realToken() {
+  return state.mcpToken ?? tokenOrPlaceholder(el.connectToken.value);
+}
+
+function snippetText(index, token) {
+  const client = CLIENTS.find((c) => c.id === state.connectClient) ?? CLIENTS[0];
+  const step = client.steps[index];
+  return step ? step.code(mcpUrl(), token) : '';
+}
+
+/** Server token (read-only, masked, Reveal/Copy) or the paste-to-fill field. */
+function applyTokenUi() {
+  const token = state.mcpToken;
+  el.connectTokenPaste.hidden = Boolean(token);
+  el.connectTokenServer.hidden = !token;
+  el.connectTokenValue.value = token ?? '';
+  el.connectTokenValue.type = token && state.tokenRevealed ? 'text' : 'password';
+  el.connectTokenReveal.textContent = state.tokenRevealed ? 'Hide' : 'Reveal';
+  el.connectTokenReveal.setAttribute('aria-pressed', String(state.tokenRevealed));
+  // The label points at whichever field is showing.
+  el.connect
+    .querySelector('label[for^="connect-token"]')
+    ?.setAttribute('for', token ? 'connect-token-value' : 'connect-token');
+}
+
+/**
+ * Ask the server whether the endpoint is on. A password-protected server also
+ * hands a logged-in person its token; an open server never sends it.
+ */
 async function openConnect() {
   if (typeof el.connect.showModal === 'function') el.connect.showModal();
   else el.connect.setAttribute('open', '');
+  state.tokenRevealed = false;
+  applyTokenUi();
+  renderConnectPanel();
   el.connectStatus.dataset.state = 'unknown';
   el.connectStatus.textContent = 'Checking the MCP server…';
+  let info;
   try {
-    const res = await fetch('/api/mcp', { headers: { accept: 'application/json' } });
-    const info = res.ok ? await res.json() : null;
-    if (info?.enabled) {
-      el.connectStatus.dataset.state = 'on';
-      el.connectStatus.textContent = 'The MCP server is on and requires a token.';
-    } else if (info) {
-      el.connectStatus.dataset.state = 'off';
-      el.connectStatus.textContent =
-        'The MCP server is off: set WEBSCOUT_MCP_TOKEN in the server\'s .env and restart it.';
-    } else {
-      throw new Error(`HTTP ${res.status}`);
+    info = await fetchMcpInfo();
+  } catch (err) {
+    if (isLoginRequired(err)) {
+      el.connect.close();
+      await requireLogin();
+      return openConnect();
     }
-  } catch {
     el.connectStatus.dataset.state = 'off';
     el.connectStatus.textContent = 'Could not ask the server whether MCP is on.';
+    return;
   }
+  const token = typeof info?.token === 'string' ? info.token.trim() : '';
+  state.mcpToken = token || null;
+  applyTokenUi();
+  renderConnectPanel();
+  if (info?.enabled) {
+    el.connectStatus.dataset.state = 'on';
+    el.connectStatus.textContent = state.mcpToken
+      ? 'The MCP server is on. Your clients need the token below.'
+      : 'The MCP server is on and requires a token.';
+  } else {
+    el.connectStatus.dataset.state = 'off';
+    el.connectStatus.textContent =
+      'The MCP server is off: set WEBSCOUT_MCP_TOKEN in the server\'s .env and restart it.';
+  }
+}
+
+// --------------------------------------------------------------------- tabs
+
+function viewFromHash() {
+  return location.hash === '#stats' ? 'stats' : 'search';
+}
+
+function wireTabs() {
+  for (const tab of el.tabButtons) {
+    tab.addEventListener('click', () => selectView(tab.dataset.view));
+  }
+  // Arrow keys move between tabs, as the tablist pattern expects.
+  el.tabs.addEventListener('keydown', (event) => {
+    const keys = { ArrowLeft: -1, ArrowRight: 1, Home: -Infinity, End: Infinity };
+    if (!(event.key in keys)) return;
+    event.preventDefault();
+    const i = el.tabButtons.findIndex((t) => t.dataset.view === state.view);
+    const step = keys[event.key];
+    const n = el.tabButtons.length;
+    const next = Number.isFinite(step) ? (i + step + n) % n : step < 0 ? 0 : n - 1;
+    selectView(el.tabButtons[next].dataset.view);
+    el.tabButtons[next].focus();
+  });
+  // Back and forward move between the tabs too.
+  window.addEventListener('popstate', () => applyView(viewFromHash()));
+  window.addEventListener('hashchange', () => applyView(viewFromHash()));
+}
+
+/** A tab click: record it in the history (so Back returns), then show it. */
+function selectView(view) {
+  if (view === state.view) return;
+  const url = `${location.pathname}${location.search}${view === 'stats' ? '#stats' : ''}`;
+  try {
+    history.pushState(null, '', url);
+  } catch {
+    /* cosmetic */
+  }
+  applyView(view);
+}
+
+function applyView(view) {
+  const changed = view !== state.view;
+  state.view = view;
+  el.app.dataset.view = view;
+  for (const tab of el.tabButtons) {
+    const on = tab.dataset.view === view;
+    tab.setAttribute('aria-selected', String(on));
+    tab.tabIndex = on ? 0 : -1;
+  }
+  // The search panel keeps its state (a finished result stays) while hidden.
+  el.viewSearch.hidden = view !== 'search';
+  el.viewStats.hidden = view !== 'stats';
+  updateLayout();
+  toggleDownloadMenu(false);
+
+  if (view === 'stats') {
+    document.title = 'Statistics · webscout';
+    if (!state.statsView) state.statsView = mountStats(el.viewStats);
+    else if (changed) state.statsView.refresh();
+    return;
+  }
+  document.title = 'webscout';
+  if (state.pendingQuery) {
+    const q = state.pendingQuery;
+    state.pendingQuery = '';
+    if (!state.running) void run(q);
+  }
+}
+
+// -------------------------------------------------------------------- login
+
+function isLoginRequired(err) {
+  return err instanceof ApiError && err.status === 401;
+}
+
+/**
+ * Show the login card (once, however many callers hit a 401) and resolve when
+ * the person has logged in. The app underneath is hidden, not torn down, so a
+ * finished result, the open tab and the options are all still there after.
+ */
+function requireLogin() {
+  if (!state.loginPromise) {
+    state.loginPromise = new Promise((resolve) => {
+      state.loginResolve = resolve;
+    });
+    showLogin();
+  }
+  return state.loginPromise;
+}
+
+function showLogin() {
+  for (const dialog of [el.help, el.connect]) if (dialog.open) dialog.close();
+  toggleDownloadMenu(false);
+  document.body.dataset.boot = 'ready';
+  el.app.hidden = true;
+  el.login.hidden = false;
+  el.loginPassword.value = '';
+  setPasswordVisible(false);
+  setLoginError('');
+  setLoginBusy(false);
+  document.title = 'Log in · webscout';
+  el.loginPassword.focus();
+}
+
+function hideLogin() {
+  el.loginPassword.value = '';
+  setPasswordVisible(false);
+  el.login.hidden = true;
+  el.app.hidden = false;
+  document.title = state.view === 'stats' ? 'Statistics · webscout' : 'webscout';
+  if (state.view === 'search' && !state.running) el.query.focus();
+  const resolve = state.loginResolve;
+  state.loginPromise = null;
+  state.loginResolve = null;
+  resolve?.();
+}
+
+function wireLogin() {
+  el.loginForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    void submitLogin();
+  });
+  el.loginEye.addEventListener('change', () => setPasswordVisible(el.loginEye.checked));
+  el.loginPassword.addEventListener('input', () => {
+    if (el.loginError.textContent) setLoginError('');
+  });
+  el.logout.addEventListener('click', () => void logOut());
+
+  // The statistics view reports its own 401s this way. Once logged in again it
+  // is refreshed, since the request that failed is its own.
+  let refreshQueued = false;
+  window.addEventListener('webscout:login-required', () => {
+    if (refreshQueued) return;
+    refreshQueued = true;
+    void requireLogin().then(() => {
+      refreshQueued = false;
+      if (state.view === 'stats') state.statsView?.refresh();
+    });
+  });
+}
+
+async function submitLogin() {
+  if (state.loggingIn) return;
+  const password = el.loginPassword.value;
+  if (!password) {
+    setLoginError('Enter the password.');
+    el.loginPassword.focus();
+    return;
+  }
+  setLoginError('');
+  setLoginBusy(true);
+  try {
+    await apiLogin(password);
+  } catch (err) {
+    setLoginBusy(false);
+    setLoginError(loginErrorText(err));
+    el.loginPassword.select();
+    el.loginPassword.focus();
+    return;
+  }
+  setLoginBusy(false);
+  hideLogin();
+}
+
+function loginErrorText(err) {
+  const status = err instanceof ApiError ? err.status : 0;
+  if (status === 401) return 'Wrong password.';
+  if (status === 429) return 'Too many attempts. Wait a minute and try again.';
+  if (status >= 500) return `The server could not log you in: ${messageOf(err)}`;
+  return messageOf(err);
+}
+
+function setLoginError(text) {
+  el.loginError.textContent = text;
+  el.login.classList.toggle('has-error', Boolean(text));
+  el.loginPassword.setAttribute('aria-invalid', String(Boolean(text)));
+  if (text) {
+    // Restart the nudge so a second wrong password is felt as well as read.
+    el.login.classList.remove('is-shaking');
+    void el.login.offsetWidth;
+    el.login.classList.add('is-shaking');
+  }
+}
+
+function setLoginBusy(busy) {
+  state.loggingIn = busy;
+  el.loginSubmit.disabled = busy;
+  el.loginSubmit.setAttribute('aria-busy', String(busy));
+  el.loginSubmitText.textContent = busy ? 'Logging in…' : 'Log in';
+  el.loginPassword.readOnly = busy;
+}
+
+function setPasswordVisible(visible) {
+  el.loginPassword.type = visible ? 'text' : 'password';
+  el.loginEye.checked = visible;
+}
+
+/** Log out, forget anything secret this page holds, and show the card. */
+async function logOut() {
+  el.logout.disabled = true;
+  if (state.running) stopRun();
+  await apiLogout();
+  state.mcpToken = null;
+  state.tokenRevealed = false;
+  el.connectToken.value = '';
+  applyTokenUi();
+  renderConnectPanel();
+  el.logout.disabled = false;
+  await requireLogin();
+  if (state.view === 'stats') state.statsView?.refresh();
 }

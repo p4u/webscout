@@ -1,10 +1,15 @@
 // "Connect AI tools": how to point an MCP client at this server. The URL is
 // this page's own origin plus /mcp (nginx proxies it to the api), so what is
-// shown is always the address the person is already using. The token is never
-// fetched from the server; a person may paste it to fill in the snippets, and
-// it stays in this page only.
+// shown is always the address the person is already using.
+//
+// The token: a password-protected server hands it to a logged-in person in
+// `GET /api/mcp` (`token`), and the snippets are filled with it — masked on
+// screen until revealed, real on the clipboard. An open server never sends it;
+// a person may paste it to fill in the snippets, and it stays in this page only.
+// Either way it is never stored or logged.
 
 const TOKEN_PLACEHOLDER = 'YOUR_TOKEN';
+const TOKEN_MASK = '•'.repeat(16);
 
 /** One entry per client. `where` says which file or command; `code` builds the snippet. */
 export const CLIENTS = [
@@ -174,4 +179,9 @@ export function mcpUrl() {
 export function tokenOrPlaceholder(raw) {
   const t = String(raw ?? '').trim();
   return t || TOKEN_PLACEHOLDER;
+}
+
+/** What the snippets show for a server token that has not been revealed. */
+export function maskedToken() {
+  return TOKEN_MASK;
 }
