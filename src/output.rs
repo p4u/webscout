@@ -139,6 +139,65 @@ fn render_csv(report: &ScoutReport) -> Result<String> {
     Ok(String::from_utf8(wtr.into_inner()?)?)
 }
 
+/// The records of a harvest as one GFM table, or an empty string when there
+/// are none.
+fn records_table(report: &ScoutReport) -> String {
+    let mut s = String::new();
+    if report.records.is_empty() {
+        return s;
+    }
+    let cols = columns(report);
+    let _ = writeln!(s, "| # | {} | source | grounding |", cols.join(" | "));
+    // The delimiter row must have exactly as many cells as the header —
+    // `#`, one per field, `source`, `grounding` — or GFM does not treat
+    // the block as a table at all and every renderer prints the raw
+    // pipes as a paragraph. Measured 2026-09-21 with marked 15: the
+    // previous line emitted `|---|---|---||---|---|` for two fields, a
+    // 6-cell row with a doubled pipe against a 5-cell header, and no
+    // table appeared in the UI.
+    let _ = writeln!(s, "|{}", "---|".repeat(cols.len() + 3));
+    for (i, r) in report.records.iter().enumerate() {
+        let values: Vec<String> = cols
+            .iter()
+            .map(|c| {
+                let val = escape_pipes(r.get(c));
+                // Show per-field source only when it differs from the row source_url.
+                let prov_note = r.provenance.get(c).and_then(|fs| {
+                    if fs.source_url != r.source_url {
+                        Some(format!(" ← {}", fs.source_url))
+                    } else {
+                        None
+                    }
+                });
+                match prov_note {
+                    Some(note) => format!("{val}{}", escape_pipes(&note)),
+                    None => val,
+                }
+            })
+            .collect();
+        let _ = writeln!(
+            s,
+            "| {} | {} | [link]({}) | {:.2} |",
+            i + 1,
+            values.join(" | "),
+            r.source_url,
+            r.grounding
+        );
+    }
+    s
+}
+
+/// The result itself, with none of the frame around it: an answer's prose, or
+/// a harvest's table. No title, outcome line, sources, notes or run stats —
+/// the web UI shows those in their own panels, and repeating them inside the
+/// reply buries it.
+pub fn markdown_body(report: &ScoutReport) -> String {
+    match report.mission.kind {
+        MissionKind::Harvest => records_table(report),
+        MissionKind::Answer => report.answer.clone().unwrap_or_default(),
+    }
+}
+
 fn render_markdown(report: &ScoutReport) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "# {}\n", report.query);
@@ -151,44 +210,7 @@ fn render_markdown(report: &ScoutReport) -> String {
 
     if report.mission.kind == MissionKind::Harvest {
         if !report.records.is_empty() {
-            let cols = columns(report);
-            let _ = writeln!(s, "| # | {} | source | grounding |", cols.join(" | "));
-            // The delimiter row must have exactly as many cells as the header —
-            // `#`, one per field, `source`, `grounding` — or GFM does not treat
-            // the block as a table at all and every renderer prints the raw
-            // pipes as a paragraph. Measured 2026-09-21 with marked 15: the
-            // previous line emitted `|---|---|---||---|---|` for two fields, a
-            // 6-cell row with a doubled pipe against a 5-cell header, and no
-            // table appeared in the UI.
-            let _ = writeln!(s, "|{}", "---|".repeat(cols.len() + 3));
-            for (i, r) in report.records.iter().enumerate() {
-                let values: Vec<String> = cols
-                    .iter()
-                    .map(|c| {
-                        let val = escape_pipes(r.get(c));
-                        // Show per-field source only when it differs from the row source_url.
-                        let prov_note = r.provenance.get(c).and_then(|fs| {
-                            if fs.source_url != r.source_url {
-                                Some(format!(" ← {}", fs.source_url))
-                            } else {
-                                None
-                            }
-                        });
-                        match prov_note {
-                            Some(note) => format!("{val}{}", escape_pipes(&note)),
-                            None => val,
-                        }
-                    })
-                    .collect();
-                let _ = writeln!(
-                    s,
-                    "| {} | {} | [link]({}) | {:.2} |",
-                    i + 1,
-                    values.join(" | "),
-                    r.source_url,
-                    r.grounding
-                );
-            }
+            s.push_str(&records_table(report));
             let _ = writeln!(s);
         }
     } else {
@@ -320,18 +342,25 @@ fn render_terminal(report: &ScoutReport) -> String {
     s
 }
 
-fn gloss(report: &ScoutReport) -> String {
+/// One plain-language line explaining the outcome.
+pub fn gloss(report: &ScoutReport) -> String {
     let harvest = report.mission.kind == MissionKind::Harvest;
     match report.outcome {
         Outcome::Complete if harvest => {
             format!("collected {} verified records", report.records.len())
         }
         Outcome::Complete => "the evidence answers the question".into(),
-        Outcome::Partial if harvest => format!(
-            "found {} of the {} requested; the reachable web ran out first",
-            report.records.len(),
-            report.mission.target_count.unwrap_or(0)
-        ),
+        // "of the 0 requested" read as nonsense on an open-ended list.
+        Outcome::Partial if harvest => match report.mission.target_count {
+            Some(target) => format!(
+                "found {} of the {target} requested; the reachable web ran out first",
+                report.records.len()
+            ),
+            None => format!(
+                "found {} records; some are missing details or could not be fully verified",
+                report.records.len()
+            ),
+        },
         Outcome::Partial => "part of the question is answered, with gaps remaining".into(),
         Outcome::Truncated => format!(
             "stopped at the round ceiling with {} records and more still appearing",
@@ -584,6 +613,33 @@ mod tests {
             out.contains("← https://example.org/contact"),
             "terminal should show per-field provenance: {out}"
         );
+    }
+
+    /// The body is the table alone: the frame (title, outcome, notes, stats)
+    /// is laid out by the reader, not repeated inside the reply.
+    #[test]
+    fn markdown_body_is_the_result_without_its_frame() {
+        let r = sample();
+        let body = markdown_body(&r);
+        assert!(body.starts_with("| # | name | email |"), "{body}");
+        assert!(body.contains("info@alpha.coop"));
+        assert!(!body.contains("# cooperatives"), "no title");
+        assert!(!body.contains("---\n\n"), "no stats rule");
+
+        let mut a = sample();
+        a.mission.kind = MissionKind::Answer;
+        a.answer = Some("Alpha is a cooperative [1].".into());
+        assert_eq!(markdown_body(&a), "Alpha is a cooperative [1].");
+    }
+
+    /// An open-ended list has no target to be "of".
+    #[test]
+    fn partial_gloss_without_a_target_names_no_zero() {
+        let mut r = sample();
+        r.mission.target_count = None;
+        let g = gloss(&r);
+        assert!(!g.contains("of the 0"), "{g}");
+        assert!(g.starts_with("found 1 records"), "{g}");
     }
 
     #[test]

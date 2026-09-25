@@ -55,10 +55,30 @@ pub struct Credentials {
     pub jina_key: Option<String>,
 }
 
+/// A configured value without surrounding whitespace or one matching pair of
+/// quotes. `.env` files quote values, and Compose strips the quotes, but
+/// `docker run --env-file` and the Railway / DigitalOcean variable screens pass
+/// them through literally: a quoted endpoint arrived as `'https://…'` and failed
+/// the https check at startup (measured 2026-09-25).
+pub(crate) fn unquote(v: &str) -> &str {
+    let t = v.trim();
+    for q in ['\'', '"'] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            return t[1..t.len() - 1].trim();
+        }
+    }
+    t
+}
+
 fn pick(flag: Option<&str>, env: &str) -> Option<String> {
-    flag.map(str::to_string)
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| std::env::var(env).ok().filter(|v| !v.trim().is_empty()))
+    flag.map(|v| unquote(v).to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var(env)
+                .ok()
+                .map(|v| unquote(&v).to_string())
+                .filter(|v| !v.is_empty())
+        })
 }
 
 impl Credentials {
@@ -203,7 +223,19 @@ pub fn suggest_chat_endpoint(url: &str) -> String {
 
 #[cfg(test)]
 mod config_tests {
-    use super::{suggest_chat_endpoint, validate_chat_endpoint};
+    use super::{suggest_chat_endpoint, unquote, validate_chat_endpoint};
+
+    #[test]
+    fn unquote_strips_one_matching_pair_and_whitespace() {
+        assert_eq!(
+            unquote("'https://x/v1/chat/completions'"),
+            "https://x/v1/chat/completions"
+        );
+        assert_eq!(unquote(" \"abc\" "), "abc");
+        assert_eq!(unquote("'abc\""), "'abc\"");
+        assert_eq!(unquote("plain"), "plain");
+        assert_eq!(unquote("''"), "");
+    }
 
     // --- validate_chat_endpoint: acceptance cases ---
 

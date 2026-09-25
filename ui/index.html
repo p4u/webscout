@@ -44,12 +44,22 @@
               <button type="button" class="btn btn--stop search__stop" id="stop" hidden>Stop</button>
             </div>
 
-            <div class="controls" id="basic-controls" aria-label="Search options"></div>
+            <div class="controls" aria-label="Search options">
+              <div class="controls__chips" id="basic-controls"></div>
+              <button type="button" class="chip chip--help" id="help-open" aria-haspopup="dialog">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9.6 9.3a2.5 2.5 0 1 1 3.4 2.3c-.6.3-1 .8-1 1.5v.4M12 16.6v.1" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
+                Examples &amp; help
+              </button>
+              <button type="button" class="chip chip--help" id="connect-open" aria-haspopup="dialog">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7zM12 16v5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Connect AI tools
+              </button>
+            </div>
 
             <details class="advanced" id="advanced">
               <summary class="advanced__summary">
                 <svg class="advanced__chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <span>Advanced settings</span>
+                <span>More options</span>
                 <span class="advanced__count" id="changed-count" hidden></span>
               </summary>
               <div class="advanced__body">
@@ -82,30 +92,33 @@
               <span class="activity__status" id="activity-status">Starting…</span>
               <span class="activity__spacer"></span>
               <span class="activity__timer" id="timer">0.0s</span>
+              <button type="button" class="btn btn--text activity__toggle" id="usage-toggle" aria-expanded="false" aria-controls="usage">Show tokens &amp; cost</button>
               <button type="button" class="btn btn--text activity__toggle" id="activity-toggle" aria-expanded="true">Hide log</button>
             </div>
             <ol class="activity__list" id="activity-list"></ol>
           </section>
 
-          <!-- Live token and cost meter. Fed by the stream's `usage` events while
-               the run is in flight and settled from the result's stats at the end,
-               so what is on screen is always what the run actually spent. -->
+          <!-- Live token and cost meter, hidden until asked for. Fed by the
+               stream's `usage` events while the run is in flight and settled from
+               the result's stats at the end, so what is on screen is always what
+               the run actually spent. -->
           <section class="usage" id="usage" hidden aria-label="Tokens and cost">
             <div class="usage__head">
               <span class="usage__title">Tokens &amp; cost</span>
               <span class="usage__total" id="usage-total"></span>
             </div>
             <div class="usage__rows" id="usage-rows"></div>
+            <div class="stats" id="stats"></div>
           </section>
 
-          <section class="result" id="result" hidden>
-            <div class="result__head">
+          <section class="reply" id="result" hidden aria-label="Result">
+            <div class="reply__head">
               <span class="outcome" id="outcome" data-outcome="">—</span>
-              <div class="stats" id="stats"></div>
+              <span class="reply__summary" id="summary"></span>
               <div class="result__actions">
-                <button type="button" class="btn btn--tonal" id="copy">Copy markdown</button>
+                <button type="button" class="btn btn--tonal btn--small" id="copy">Copy</button>
                 <div class="menu" id="download-menu">
-                  <button type="button" class="btn btn--tonal menu__trigger" id="download-trigger" aria-haspopup="true" aria-expanded="false">
+                  <button type="button" class="btn btn--tonal btn--small menu__trigger" id="download-trigger" aria-haspopup="true" aria-expanded="false">
                     Download
                     <svg viewBox="0 0 24 24" aria-hidden="true" class="menu__caret"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
                   </button>
@@ -113,11 +126,66 @@
                 </div>
               </div>
             </div>
+            <article class="prose reply__body" id="prose"></article>
             <ul class="notes" id="notes" hidden></ul>
-            <article class="prose" id="prose"></article>
+            <div class="reply__foot">
+              <button type="button" class="btn btn--text" id="sources-toggle" aria-expanded="false" aria-controls="sources" hidden>Show sources</button>
+              <span class="reply__took" id="took"></span>
+            </div>
+          </section>
+
+          <section class="sources" id="sources" hidden aria-label="Sources">
+            <h2 class="sources__title">Sources</h2>
+            <p class="sources__intro">The pages the answer was checked against. Numbers match the citations in the answer.</p>
+            <ol class="sources__list" id="sources-list"></ol>
+            <div class="sources__quarantine" id="quarantine" hidden>
+              <p class="sources__warn">Ignored: these pages contained instructions aimed at AI readers, so nothing on them was used.</p>
+              <ul id="quarantine-list"></ul>
+            </div>
           </section>
         </div>
       </main>
+
+      <dialog class="help" id="help" aria-labelledby="help-title">
+        <div class="help__head">
+          <h2 class="help__title" id="help-title">What can I ask?</h2>
+          <button type="button" class="help__close" id="help-close" aria-label="Close help">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <p class="help__intro">webscout searches the web, reads the pages, and returns only what it could check against them. Pick an example to put it in the search box, change it if you like, then press Search.</p>
+        <div class="help__groups" id="help-groups"></div>
+        <h3 class="help__subtitle">Good to know</h3>
+        <ul class="help__tips" id="help-tips"></ul>
+      </dialog>
+
+      <dialog class="help connect" id="connect" aria-labelledby="connect-title">
+        <div class="help__head">
+          <h2 class="help__title" id="connect-title">Use webscout from your AI tools</h2>
+          <button type="button" class="help__close" id="connect-close" aria-label="Close">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <p class="help__intro">webscout is also an MCP server, so Claude Code, opencode, pi and other AI assistants can run searches themselves and read the verified results.</p>
+
+        <div class="connect__status" id="connect-status" data-state="unknown"></div>
+
+        <label class="connect__label" for="connect-url">Server address</label>
+        <div class="connect__row">
+          <input class="field__input connect__url" id="connect-url" readonly />
+          <button type="button" class="btn btn--tonal btn--small" data-copy-target="connect-url">Copy</button>
+        </div>
+
+        <label class="connect__label" for="connect-token">Access token</label>
+        <input class="field__input" id="connect-token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste it here to fill in the examples below (optional)" />
+        <p class="field__help">Every client must send the token. It is the value of <code>WEBSCOUT_MCP_TOKEN</code> in the server's <code>.env</code> file; ask whoever runs this server. What you paste here stays in this page and is not saved.</p>
+
+        <div class="connect__tabs" role="tablist" id="connect-tabs"></div>
+        <div class="connect__panel" id="connect-panel" role="tabpanel"></div>
+
+        <h3 class="help__subtitle">What your assistant gets</h3>
+        <ul class="help__tips" id="connect-tools"></ul>
+      </dialog>
 
       <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     </div>

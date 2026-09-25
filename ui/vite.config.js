@@ -15,6 +15,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      '/mcp': { target, changeOrigin: true },
       '/api': {
         target,
         changeOrigin: true,
@@ -29,6 +30,6 @@ export default defineConfig({
   },
   preview: {
     port: 4173,
-    proxy: { '/api': { target, changeOrigin: true } },
+    proxy: { '/api': { target, changeOrigin: true }, '/mcp': { target, changeOrigin: true } },
   },
 });

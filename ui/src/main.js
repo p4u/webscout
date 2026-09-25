@@ -2,6 +2,8 @@ import './styles.css';
 import { ApiError, downloadUrl, fetchOptions, streamSearch } from './api.js';
 import { createControls } from './options.js';
 import { renderMarkdown, renderPlain, wrapTables } from './markdown.js';
+import { EXAMPLE_GROUPS, TIPS } from './examples.js';
+import { CLIENTS, TOOL_NOTES, mcpUrl, tokenOrPlaceholder } from './connect.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -28,6 +30,7 @@ const el = {
   activityStatus: $('activity-status'),
   activityList: $('activity-list'),
   activityToggle: $('activity-toggle'),
+  usageToggle: $('usage-toggle'),
   timer: $('timer'),
 
   usage: $('usage'),
@@ -36,9 +39,32 @@ const el = {
 
   result: $('result'),
   outcome: $('outcome'),
+  summary: $('summary'),
   stats: $('stats'),
   notes: $('notes'),
   prose: $('prose'),
+  took: $('took'),
+  sourcesToggle: $('sources-toggle'),
+  sources: $('sources'),
+  sourcesList: $('sources-list'),
+  quarantine: $('quarantine'),
+  quarantineList: $('quarantine-list'),
+
+  help: $('help'),
+  helpOpen: $('help-open'),
+  helpClose: $('help-close'),
+  helpGroups: $('help-groups'),
+  helpTips: $('help-tips'),
+
+  connect: $('connect'),
+  connectOpen: $('connect-open'),
+  connectClose: $('connect-close'),
+  connectStatus: $('connect-status'),
+  connectUrl: $('connect-url'),
+  connectToken: $('connect-token'),
+  connectTabs: $('connect-tabs'),
+  connectPanel: $('connect-panel'),
+  connectTools: $('connect-tools'),
   copy: $('copy'),
   downloadTrigger: $('download-trigger'),
   downloadList: $('download-list'),
@@ -66,6 +92,10 @@ const state = {
   lastQuery: '',
   lastStats: null,
   lastUsage: null,
+  // Tokens and cost are for the curious; remembered across visits once shown.
+  showUsage: readPref('webscout.showUsage'),
+  // Which client's setup the "Connect AI tools" dialog shows.
+  connectClient: 'claude',
   // Incremented on every run. A late event from a superseded run is ignored rather
   // than allowed to overwrite the current one.
   token: 0,
@@ -77,6 +107,9 @@ init();
 
 async function init() {
   wireStaticHandlers();
+  renderHelp();
+  renderConnect();
+  applyUsageVisibility();
   await loadOptions();
 
   // ?q=... makes a search linkable and re-runnable.
@@ -158,6 +191,47 @@ function wireStaticHandlers() {
     setActivityLogOpen(el.activityList.hidden);
   });
 
+  el.usageToggle.addEventListener('click', () => {
+    state.showUsage = !state.showUsage;
+    writePref('webscout.showUsage', state.showUsage);
+    applyUsageVisibility();
+  });
+
+  el.sourcesToggle.addEventListener('click', () => {
+    setSourcesOpen(el.sources.hidden);
+  });
+
+  // A citation in the answer opens the sources box at the page it names.
+  el.prose.addEventListener('click', (event) => {
+    const cite = event.target.closest?.('a.cite');
+    if (!cite) return;
+    event.preventDefault();
+    setSourcesOpen(true);
+    const item = document.getElementById(`source-${cite.dataset.source}`);
+    if (!item) return;
+    item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    item.classList.remove('is-flash');
+    void item.offsetWidth; // restart the highlight animation
+    item.classList.add('is-flash');
+  });
+
+  el.helpOpen.addEventListener('click', () => openHelp());
+  el.connectOpen.addEventListener('click', () => void openConnect());
+  el.connectClose.addEventListener('click', () => el.connect.close());
+  el.connect.addEventListener('click', (event) => {
+    if (event.target === el.connect) el.connect.close();
+    const copy = event.target.closest?.('[data-copy-target]');
+    if (copy) void copyText(document.getElementById(copy.dataset.copyTarget)?.value ?? '');
+    const copyCode = event.target.closest?.('[data-copy-code]');
+    if (copyCode) void copyText(copyCode.parentElement.querySelector('code')?.textContent ?? '');
+  });
+  el.connectToken.addEventListener('input', () => renderConnectPanel());
+  el.helpClose.addEventListener('click', () => el.help.close());
+  // A click on the backdrop (outside the dialog box) closes it.
+  el.help.addEventListener('click', (event) => {
+    if (event.target === el.help) el.help.close();
+  });
+
   el.copy.addEventListener('click', () => void copyContent());
 
   el.downloadTrigger.addEventListener('click', (event) => {
@@ -212,9 +286,10 @@ async function run(rawQuery) {
   el.activityList.replaceChildren();
   setActivityLogOpen(true);
   setStatus('Contacting webscout…');
-  // Show the meter at zero from the first instant, so it is a thing that fills
-  // rather than a thing that appears.
+  // The meter starts at zero from the first instant, so when someone opens it
+  // mid-run it is a thing that fills rather than a thing that appears.
   renderUsage(null);
+  el.stats.replaceChildren();
 
   const controller = new AbortController();
   state.controller = controller;
@@ -402,14 +477,17 @@ function showResult(event) {
   const outcome = String(event.outcome ?? 'complete').toLowerCase();
   const format = String(event.format ?? state.lastFormat ?? 'markdown').toLowerCase();
   const content = typeof event.content === 'string' ? event.content : '';
+  const sources = Array.isArray(event.sources) ? event.sources : [];
 
   state.lastContent = content;
   state.lastFormat = format;
   state.lastStats = { ...(state.lastStats ?? {}), ...(event.stats ?? {}) };
 
+  el.result.dataset.outcome = outcome;
   el.outcome.dataset.outcome = outcome;
-  el.outcome.textContent = outcome;
+  el.outcome.textContent = OUTCOME_LABEL[outcome] ?? outcome;
   el.outcome.title = OUTCOME_HELP[outcome] ?? '';
+  el.summary.textContent = sentence(event.summary);
 
   renderStats(state.lastStats);
   // Settle the meter on the run's own accounting, so the panel and the result
@@ -417,38 +495,226 @@ function showResult(event) {
   renderUsage(usageFromStats(event.stats));
   renderNotes(collectNotes(event));
 
-  el.prose.innerHTML =
-    format === 'markdown' || format === 'terminal'
-      ? renderMarkdown(content)
-      : renderPlain(content, format === 'jsonl' ? 'json' : format);
+  // Formatted text shows the reply alone — sources, notes and run figures have
+  // their own places. `body` is absent from an older API; fall back to the
+  // whole document then.
+  if (format === 'markdown' || format === 'terminal') {
+    const body = typeof event.body === 'string' ? event.body : content;
+    el.prose.innerHTML = body.trim()
+      ? renderMarkdown(body)
+      : `<p class="reply__empty">${escapeText(emptyText(event))}</p>`;
+    linkCitations(el.prose, sources);
+  } else {
+    el.prose.innerHTML = renderPlain(content, format === 'jsonl' ? 'json' : format);
+  }
   wrapTables(el.prose);
 
+  renderSources(sources, Array.isArray(event.quarantined) ? event.quarantined : []);
+  renderTook(state.lastStats);
+
   renderDownloads();
-  el.copy.textContent = format === 'markdown' ? 'Copy markdown' : `Copy ${format}`;
   el.copy.disabled = content.length === 0;
 
   el.result.hidden = false;
-  setStatus(`Finished · ${outcome}`);
+  setStatus(`Finished · ${(OUTCOME_LABEL[outcome] ?? outcome).toLowerCase()}`);
   // Give the answer the page; the log stays one click away.
   setActivityLogOpen(false);
 }
 
+const OUTCOME_LABEL = {
+  complete: 'Complete',
+  partial: 'Partial',
+  truncated: 'Stopped early',
+  empty: 'Nothing found',
+};
+
 const OUTCOME_HELP = {
   complete: 'The run satisfied the request.',
-  partial: 'The web ran out before the target did, or some claims were unsupported.',
-  truncated: 'The round ceiling hit while results were still arriving. Set a higher max rounds for more.',
+  partial: 'Part of the request was answered; the rest could not be found or verified.',
+  truncated: 'The round limit was reached while results were still arriving. Allow more search rounds for more.',
   empty: 'Nothing verifiable was found. This is a result, not a failure.',
 };
+
+function emptyText(event) {
+  const kind = String(event.kind ?? event.mission?.kind ?? '');
+  return kind === 'harvest'
+    ? 'No items could be verified. Try wording the list differently, or a broader description.'
+    : 'No answer could be verified from the pages found. Try rephrasing, or naming the organisation or product more precisely.';
+}
+
+/** "the evidence answers the question" → "The evidence answers the question." */
+function sentence(text) {
+  if (typeof text !== 'string' || !text.trim()) return '';
+  const t = text.trim();
+  return t[0].toUpperCase() + t.slice(1) + (/[.!?]$/.test(t) ? '' : '.');
+}
+
+function escapeText(text) {
+  const d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
+}
+
+/**
+ * Turn the answer's `[n]` citations into links to source n. Walks text nodes
+ * only, so nothing the sanitiser removed can come back, and leaves code and
+ * existing links alone.
+ */
+function linkCitations(root, sources) {
+  if (!sources.length) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) =>
+      node.parentElement?.closest('a, code, pre') || !/\[\d{1,3}\]/.test(node.nodeValue)
+        ? NodeFilter.FILTER_REJECT
+        : NodeFilter.FILTER_ACCEPT,
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+
+  for (const node of nodes) {
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    const text = node.nodeValue;
+    for (const m of text.matchAll(/\[(\d{1,3})\]/g)) {
+      const n = Number(m[1]);
+      const source = sources[n - 1];
+      if (!source) continue;
+      // "[1], [2]" reads as a row of badges; the comma between two of them
+      // is noise once they are drawn as badges.
+      const between = text.slice(last, m.index);
+      if (!(last > 0 && /^\s*,?\s*$/.test(between))) frag.append(between);
+      const a = document.createElement('a');
+      a.className = 'cite';
+      a.href = `#source-${n}`;
+      a.dataset.source = String(n);
+      a.textContent = String(n);
+      a.title = source.title || hostOf(source.url);
+      frag.append(a);
+      last = m.index + m[0].length;
+    }
+    if (last === 0) continue;
+    frag.append(text.slice(last));
+    node.replaceWith(frag);
+  }
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return String(url ?? '');
+  }
+}
+
+/** Only web links become clickable; anything else is shown as text. */
+function safeHref(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function supportLabel(p) {
+  const v = Number(p);
+  if (!Number.isFinite(v)) return null;
+  if (v >= 0.8) return ['strong', 'Strong support'];
+  if (v >= 0.5) return ['medium', 'Supports'];
+  return ['weak', 'Weak support'];
+}
+
+function renderSources(sources, quarantined) {
+  el.sourcesList.replaceChildren();
+  el.quarantineList.replaceChildren();
+
+  sources.forEach((source, i) => {
+    const li = document.createElement('li');
+    li.className = 'source';
+    li.id = `source-${i + 1}`;
+
+    const num = document.createElement('span');
+    num.className = 'source__num';
+    num.textContent = String(i + 1);
+
+    const main = document.createElement('div');
+    main.className = 'source__main';
+    const href = safeHref(source.url);
+    const title = document.createElement(href ? 'a' : 'span');
+    title.className = 'source__title';
+    title.textContent = (source.title || '').trim() || hostOf(source.url);
+    if (href) {
+      title.href = href;
+      title.target = '_blank';
+      title.rel = 'noopener noreferrer';
+    }
+    const host = document.createElement('span');
+    host.className = 'source__host';
+    host.textContent = hostOf(source.url);
+    main.append(title, host);
+
+    li.append(num, main);
+    const support = supportLabel(source.supports);
+    if (support) {
+      const pill = document.createElement('span');
+      pill.className = `source__support source__support--${support[0]}`;
+      pill.textContent = support[1];
+      pill.title = `How strongly this page supports the answer: ${Math.round(Number(source.supports) * 100)}%`;
+      li.appendChild(pill);
+    }
+    el.sourcesList.appendChild(li);
+  });
+
+  for (const url of quarantined) {
+    const li = document.createElement('li');
+    li.textContent = String(url);
+    el.quarantineList.appendChild(li);
+  }
+  el.quarantine.hidden = quarantined.length === 0;
+  el.sourcesList.hidden = sources.length === 0;
+
+  const count = sources.length + quarantined.length;
+  el.sourcesToggle.hidden = count === 0;
+  el.sourcesToggle.dataset.count = String(sources.length || quarantined.length);
+  setSourcesOpen(false);
+}
+
+function setSourcesOpen(open) {
+  const hasAny = !el.sourcesToggle.hidden;
+  el.sources.hidden = !(open && hasAny);
+  const n = el.sourcesToggle.dataset.count ?? '';
+  el.sourcesToggle.textContent = `${open ? 'Hide' : 'Show'} sources${n ? ` (${n})` : ''}`;
+  el.sourcesToggle.setAttribute('aria-expanded', String(open && hasAny));
+}
+
+/** One quiet line under the reply: how long it took and how much was read. */
+function renderTook(stats) {
+  if (!stats) {
+    el.took.textContent = '';
+    return;
+  }
+  const parts = [];
+  const ms = pick(stats, ['elapsed_ms', 'total_ms', 'duration_ms']);
+  const secs = pick(stats, ['elapsed_secs']);
+  if (ms != null) parts.push(`took ${formatDuration(Number(ms))}`);
+  else if (secs != null) parts.push(`took ${formatDuration(Number(secs) * 1000)}`);
+  const pages = pick(stats, ['pages_fetched', 'pages_read', 'pages']);
+  if (pages != null) parts.push(`${formatNumber(Number(pages))} pages read`);
+  el.took.textContent = parts.length ? sentence(parts.join(' · ')) : '';
+}
 
 function renderStats(stats) {
   el.stats.replaceChildren();
   if (!stats) return;
 
-  const elapsedMs = pick(stats, ['elapsed_ms', 'total_ms', 'duration_ms']);
+  const secs = pick(stats, ['elapsed_secs']);
+  const elapsedMs =
+    pick(stats, ['elapsed_ms', 'total_ms', 'duration_ms']) ?? (secs != null ? Number(secs) * 1000 : null);
   const rows = [
     ['Elapsed', elapsedMs != null ? formatDuration(Number(elapsedMs)) : null],
     ['Pages', pick(stats, ['pages_fetched', 'pages_read', 'pages'])],
-    ['Records', pick(stats, ['records', 'records_found', 'record_count'])],
+    // An answer has no records; "0 records" would read as a failure.
+    ['Records', pick(stats, ['records', 'records_found', 'record_count']) || null],
     ['Jev', pick(stats, ['jev_requests', 'typesafe_requests'])],
     ['LLM', pick(stats, ['llm_requests'])],
     ['Rounds', pick(stats, ['rounds'])],
@@ -550,7 +816,6 @@ function usageTotal(rows) {
 
 function renderUsage(event) {
   state.lastUsage = event;
-  el.usage.hidden = false;
   el.usageRows.replaceChildren();
 
   const rows = usageRows(event);
@@ -668,17 +933,22 @@ function toggleDownloadMenu(open) {
 
 async function copyContent() {
   if (!state.lastContent) return;
+  await copyText(state.lastContent);
+}
+
+async function copyText(text) {
+  if (!text) return;
   try {
     if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(state.lastContent);
+      await navigator.clipboard.writeText(text);
     } else {
-      legacyCopy(state.lastContent);
+      legacyCopy(text);
     }
     toast('Copied to clipboard');
   } catch {
     // Clipboard permission can be denied (or absent over plain http on a LAN).
     try {
-      legacyCopy(state.lastContent);
+      legacyCopy(text);
       toast('Copied to clipboard');
     } catch {
       toast('Could not copy — select the text and copy manually');
@@ -703,6 +973,10 @@ function hideResult() {
   el.result.hidden = true;
   el.prose.replaceChildren();
   el.notes.hidden = true;
+  el.sources.hidden = true;
+  el.sourcesList.replaceChildren();
+  el.summary.textContent = '';
+  el.took.textContent = '';
   state.lastRunId = null;
   state.lastContent = '';
   state.lastStats = null;
@@ -719,8 +993,8 @@ function resetToIdle() {
   clearError();
   el.activity.hidden = true;
   el.activityList.replaceChildren();
-  el.usage.hidden = true;
   el.usageRows.replaceChildren();
+  el.stats.replaceChildren();
   el.usageTotal.textContent = '';
   state.lastUsage = null;
   el.query.value = '';
@@ -791,4 +1065,167 @@ function toast(text) {
   state.toastId = window.setTimeout(() => {
     el.toast.hidden = true;
   }, 2400);
+}
+
+// ------------------------------------------------------------ usage toggle
+
+/** The meter exists from the start of a run; it is only shown on request. */
+function applyUsageVisibility() {
+  const show = state.showUsage;
+  el.usage.hidden = !show;
+  el.usageToggle.textContent = show ? 'Hide tokens & cost' : 'Show tokens & cost';
+  el.usageToggle.setAttribute('aria-expanded', String(show));
+}
+
+function readPref(key) {
+  try {
+    return localStorage.getItem(key) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writePref(key, on) {
+  try {
+    localStorage.setItem(key, on ? '1' : '0');
+  } catch {
+    /* private mode: the choice lasts for this page only */
+  }
+}
+
+// --------------------------------------------------------------------- help
+
+function renderHelp() {
+  el.helpGroups.replaceChildren();
+  for (const group of EXAMPLE_GROUPS) {
+    const section = document.createElement('section');
+    section.className = 'help__group';
+    const h = document.createElement('h3');
+    h.className = 'help__group-title';
+    h.textContent = group.title;
+    const blurb = document.createElement('p');
+    blurb.className = 'help__blurb';
+    blurb.textContent = group.blurb;
+    const list = document.createElement('div');
+    list.className = 'help__examples';
+    for (const example of group.examples) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'help__example';
+      b.textContent = example;
+      b.addEventListener('click', () => useExample(example));
+      list.appendChild(b);
+    }
+    section.append(h, blurb, list);
+    el.helpGroups.appendChild(section);
+  }
+  el.helpTips.replaceChildren(
+    ...TIPS.map((tip) => {
+      const li = document.createElement('li');
+      li.textContent = tip;
+      return li;
+    }),
+  );
+}
+
+function openHelp() {
+  if (typeof el.help.showModal === 'function') el.help.showModal();
+  else el.help.setAttribute('open', '');
+}
+
+function useExample(text) {
+  el.help.close();
+  if (state.running) return;
+  el.query.value = text;
+  el.clearQuery.hidden = false;
+  el.query.focus();
+  el.query.setSelectionRange(text.length, text.length);
+}
+
+// ------------------------------------------------------------ connect (MCP)
+
+function renderConnect() {
+  el.connectUrl.value = mcpUrl();
+  el.connectTabs.replaceChildren(
+    ...CLIENTS.map((c) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'connect__tab';
+      b.setAttribute('role', 'tab');
+      b.dataset.client = c.id;
+      b.textContent = c.name;
+      b.addEventListener('click', () => {
+        state.connectClient = c.id;
+        renderConnectPanel();
+      });
+      return b;
+    }),
+  );
+  el.connectTools.replaceChildren(
+    ...TOOL_NOTES.map(([name, text]) => {
+      const li = document.createElement('li');
+      const code = document.createElement('code');
+      code.textContent = name;
+      li.append(code, ` ${text}`);
+      return li;
+    }),
+  );
+  renderConnectPanel();
+}
+
+function renderConnectPanel() {
+  const client = CLIENTS.find((c) => c.id === state.connectClient) ?? CLIENTS[0];
+  for (const tab of el.connectTabs.children) {
+    const on = tab.dataset.client === client.id;
+    tab.setAttribute('aria-selected', String(on));
+    tab.classList.toggle('is-active', on);
+  }
+  const url = mcpUrl();
+  const token = tokenOrPlaceholder(el.connectToken.value);
+  el.connectPanel.replaceChildren(
+    ...client.steps.map((step) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'connect__step';
+      const p = document.createElement('p');
+      p.className = 'connect__where';
+      p.textContent = step.where;
+      const pre = document.createElement('pre');
+      pre.className = 'connect__code';
+      const code = document.createElement('code');
+      code.textContent = step.code(url, token);
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.className = 'btn btn--tonal btn--small connect__copy';
+      copy.dataset.copyCode = '';
+      copy.textContent = 'Copy';
+      pre.append(code, copy);
+      wrap.append(p, pre);
+      return wrap;
+    }),
+  );
+}
+
+/** Ask the server whether the endpoint is on; the token itself is never sent to the page. */
+async function openConnect() {
+  if (typeof el.connect.showModal === 'function') el.connect.showModal();
+  else el.connect.setAttribute('open', '');
+  el.connectStatus.dataset.state = 'unknown';
+  el.connectStatus.textContent = 'Checking the MCP server…';
+  try {
+    const res = await fetch('/api/mcp', { headers: { accept: 'application/json' } });
+    const info = res.ok ? await res.json() : null;
+    if (info?.enabled) {
+      el.connectStatus.dataset.state = 'on';
+      el.connectStatus.textContent = 'The MCP server is on and requires a token.';
+    } else if (info) {
+      el.connectStatus.dataset.state = 'off';
+      el.connectStatus.textContent =
+        'The MCP server is off: set WEBSCOUT_MCP_TOKEN in the server\'s .env and restart it.';
+    } else {
+      throw new Error(`HTTP ${res.status}`);
+    }
+  } catch {
+    el.connectStatus.dataset.state = 'off';
+    el.connectStatus.textContent = 'Could not ask the server whether MCP is on.';
+  }
 }

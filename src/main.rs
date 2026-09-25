@@ -17,6 +17,7 @@ mod candidates;
 mod clock;
 mod config;
 mod llm;
+mod mcp;
 mod output;
 mod scout;
 mod search_cache;
@@ -80,6 +81,44 @@ struct Cli {
         default_value_t = crate::api::DEFAULT_API_PORT
     )]
     api_port: u16,
+
+    /// Bearer token the API's MCP endpoint (`/mcp`) requires. Without one the
+    /// endpoint is disabled — it never runs open. Falls back to
+    /// $WEBSCOUT_MCP_TOKEN.
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        env = "WEBSCOUT_MCP_TOKEN",
+        hide_env_values = true
+    )]
+    mcp_token: Option<String>,
+
+    /// Serve the built web UI (the `ui/dist` directory) from the API process,
+    /// so one container is the whole product. Falls back to $WEBSCOUT_UI_DIR.
+    #[arg(long, value_name = "DIR", env = "WEBSCOUT_UI_DIR")]
+    ui_dir: Option<std::path::PathBuf>,
+
+    /// Require this `user:password` login (HTTP Basic) for the UI and the
+    /// HTTP API — everything except /api/health and /mcp, which has its own
+    /// token. Set it on any public deployment: searches are billed to the
+    /// server's keys. Falls back to $WEBSCOUT_AUTH.
+    #[arg(
+        long,
+        value_name = "USER:PASSWORD",
+        env = "WEBSCOUT_AUTH",
+        hide_env_values = true
+    )]
+    basic_auth: Option<String>,
+
+    /// Most MCP searches allowed to run at once. Falls back to
+    /// $WEBSCOUT_MCP_MAX_RUNNING.
+    #[arg(
+        long,
+        value_name = "N",
+        env = "WEBSCOUT_MCP_MAX_RUNNING",
+        default_value_t = crate::mcp::DEFAULT_MAX_RUNNING
+    )]
+    mcp_max_running: usize,
 
     /// Output format.
     #[arg(short, long, value_enum, default_value = "terminal")]
@@ -565,7 +604,10 @@ async fn run(cli: Cli) -> Result<i32> {
             cli.thinking_control,
             cli.planner_thinking_control.unwrap_or(cli.thinking_control),
             cli.fetch_concurrency,
-        );
+        )
+        .with_mcp(cli.mcp_token.clone(), cli.mcp_max_running)
+        .with_ui_dir(cli.ui_dir.clone())
+        .with_basic_auth(cli.basic_auth.clone());
         api::serve(cli.api_port, state).await?;
         return Ok(0);
     }

@@ -161,6 +161,17 @@ function stepFor(option) {
   return span <= 1 ? '0.05' : 'any';
 }
 
+/** The schema may name each enum value for people (`value_labels`); the value is still what is sent. */
+function appendChoices(select, option) {
+  const labels = Array.isArray(option.value_labels) ? option.value_labels : [];
+  (option.values ?? []).forEach((v, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(v);
+    opt.textContent = typeof labels[i] === 'string' && labels[i] ? labels[i] : String(v);
+    select.appendChild(opt);
+  });
+}
+
 function labelFor(option) {
   if (typeof option.label === 'string' && option.label) return option.label;
   return option.name.replaceAll('_', ' ').replace(/^./, (c) => c.toUpperCase());
@@ -184,12 +195,7 @@ function buildChip(option, value, onInput) {
   if (type === 'enum' || (Array.isArray(option.values) && option.values.length)) {
     input = document.createElement('select');
     input.className = 'chip__control';
-    for (const v of option.values ?? []) {
-      const opt = document.createElement('option');
-      opt.value = String(v);
-      opt.textContent = String(v);
-      input.appendChild(opt);
-    }
+    appendChoices(input, option);
     input.value = value === null || value === undefined ? '' : String(value);
     input.addEventListener('change', () => onInput(input.value));
   } else if (type === 'boolean') {
@@ -274,12 +280,7 @@ function buildField(option, value, onInput) {
     input = document.createElement('select');
     input.className = 'field__input';
     input.id = id;
-    for (const v of option.values ?? []) {
-      const opt = document.createElement('option');
-      opt.value = String(v);
-      opt.textContent = String(v);
-      input.appendChild(opt);
-    }
+    appendChoices(input, option);
     input.value = value === null || value === undefined ? '' : String(value);
     input.addEventListener('change', () => onInput(input.value));
     el.append(label, input);

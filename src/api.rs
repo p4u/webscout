@@ -59,7 +59,7 @@ const MAX_STORED_RUNS: usize = 20;
 /// Generous, because the events are tiny and a browser on a slow link should not
 /// lose the story of a run. Overflow drops rather than blocks — the run is the
 /// thing that matters, not the commentary.
-const PROGRESS_BUFFER: usize = 256;
+pub(crate) const PROGRESS_BUFFER: usize = 256;
 
 /// How often the stream samples the clients' counters while a run is in flight.
 ///
@@ -166,7 +166,7 @@ impl UsageSnapshot {
 /// an absent cost means the endpoint does not report one, and an absent
 /// reasoning count means none was spent. Both are cleaner for a reader than a
 /// zero that has to be interpreted.
-fn llm_usage_json(u: &LlmUsage) -> Value {
+pub(crate) fn llm_usage_json(u: &LlmUsage) -> Value {
     let mut o = json!({
         "requests": u.requests,
         "prompt_tokens": u.prompt_tokens,
@@ -196,7 +196,7 @@ fn format_run_id(nanos: u128, seq: u64) -> String {
     format!("{nanos:x}-{seq:x}")
 }
 
-fn new_run_id() -> String {
+pub(crate) fn new_run_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -219,7 +219,7 @@ fn rfc3339(secs: u64) -> String {
     )
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     rfc3339(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -281,7 +281,7 @@ pub enum OptionType {
 }
 
 impl OptionType {
-    fn noun(self) -> &'static str {
+    pub(crate) fn noun(self) -> &'static str {
         match self {
             OptionType::Integer => "whole number",
             OptionType::Number => "number",
@@ -306,6 +306,10 @@ pub struct OptionSpec {
     pub max: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<&'static str>>,
+    /// Human names for `values`, same order and length. The value is what is
+    /// sent; the label is what a person reads ("Spreadsheet (CSV)" for `csv`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_labels: Option<Vec<&'static str>>,
     /// The option also accepts the string `"auto"`, meaning "let the run
     /// decide". A generic flag rather than a special case so the UI, which
     /// renders every control from this schema, needs no knowledge of which
@@ -318,6 +322,11 @@ pub struct OptionSpec {
 }
 
 /// A rendered group of options.
+///
+/// `basic` and `advanced` are what the web UI shows — the few settings a person
+/// running a search has a reason to touch, worded for them. `expert` holds the
+/// tuning knobs (thresholds, batch sizes, concurrency, models): accepted by the
+/// API exactly as before, not rendered by the UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct OptionGroup {
     pub id: &'static str,
@@ -341,6 +350,7 @@ fn int_opt(
         min: Some(json!(min)),
         max: Some(json!(max)),
         values: None,
+        value_labels: None,
         auto: false,
         help,
     }
@@ -362,6 +372,7 @@ fn num_opt(
         min: Some(json!(min)),
         max: Some(json!(max)),
         values: None,
+        value_labels: None,
         auto: false,
         help,
     }
@@ -381,6 +392,7 @@ fn bool_opt(
         min: None,
         max: None,
         values: None,
+        value_labels: None,
         auto: false,
         help,
     }
@@ -401,6 +413,7 @@ fn enum_opt(
         min: None,
         max: None,
         values: Some(values.to_vec()),
+        value_labels: None,
         auto: false,
         help,
     }
@@ -418,6 +431,7 @@ fn string_opt(name: &'static str, label: &'static str, help: &'static str) -> Op
         min: None,
         max: None,
         values: None,
+        value_labels: None,
         auto: false,
         help,
     }
@@ -445,32 +459,73 @@ pub fn catalogue() -> Vec<OptionGroup> {
             id: "basic",
             label: "Search",
             options: vec![
-                enum_opt(
-                    "preset",
-                    "Preset",
-                    Preset::Standard.as_str(),
-                    &PRESETS,
-                    "Starting point for every other setting: quick looks, standard digs, thorough leaves no stone unturned.",
-                ),
+                OptionSpec {
+                    value_labels: Some(vec!["Quick", "Standard", "Thorough"]),
+                    ..enum_opt(
+                        "preset",
+                        "Search depth",
+                        Preset::Standard.as_str(),
+                        &PRESETS,
+                        "How hard to look. Quick reads fewer pages and finishes first; Standard suits most questions; Thorough reads the most pages and takes the longest.",
+                    )
+                },
+                OptionSpec {
+                    value_labels: Some(vec![
+                        "Formatted text",
+                        "JSON",
+                        "Spreadsheet (CSV)",
+                        "JSON Lines",
+                    ]),
+                    ..enum_opt(
+                        "format",
+                        "Result format",
+                        "markdown",
+                        &FORMATS,
+                        "How the result is shown and downloaded. Formatted text suits most people; CSV opens in a spreadsheet and is meant for lists.",
+                    )
+                },
+            ],
+        },
+        OptionGroup {
+            id: "advanced",
+            label: "More options",
+            options: vec![
                 OptionSpec {
                     auto: true,
                     default: json!("auto"),
                     ..int_opt(
                         "max_rounds",
-                        "Max rounds",
+                        "Search rounds",
                         d.max_rounds,
                         1,
                         200,
-                        "Leave on auto to let the run stop when it has what it needs or progress levels off, or set a number to cap the rounds exactly. There is no time limit either way.",
+                        "Each round runs new searches and reads new pages. Leave empty and the search stops by itself once it has what it needs; enter a number to allow exactly up to that many rounds.",
                     )
                 },
-                enum_opt(
-                    "format",
-                    "Format",
-                    "markdown",
-                    &FORMATS,
-                    "How the finished result is rendered.",
+                bool_opt(
+                    "no_enrich",
+                    "Skip missing details",
+                    false,
+                    "For lists: keep only what the list pages themselves say, instead of looking up each item's missing details (email, website, …). Much faster, less complete.",
                 ),
+                bool_opt(
+                    "no_follow",
+                    "Don't open links on list pages",
+                    false,
+                    "For lists: stay on the pages the search found instead of also opening the links they point to. Faster, may find fewer items.",
+                ),
+                bool_opt(
+                    "no_search_cache",
+                    "Always search fresh",
+                    false,
+                    "Ignore search results saved in the last few hours and ask the search engines again. Use it when something changed very recently.",
+                ),
+            ],
+        },
+        OptionGroup {
+            id: "expert",
+            label: "Expert",
+            options: vec![
                 enum_opt(
                     "search_engines",
                     "Search engines",
@@ -478,12 +533,6 @@ pub fn catalogue() -> Vec<OptionGroup> {
                     &ENGINES,
                     "Which search lanes to run: auto uses every lane available, or pin a single engine.",
                 ),
-            ],
-        },
-        OptionGroup {
-            id: "advanced",
-            label: "Advanced",
-            options: vec![
                 int_opt(
                     "queries_per_round",
                     "Queries per round",
@@ -627,28 +676,10 @@ pub fn catalogue() -> Vec<OptionGroup> {
                     "Skip the one-off research plan and rely on the round-by-round planner instead.",
                 ),
                 bool_opt(
-                    "no_enrich",
-                    "Disable enrichment",
-                    false,
-                    "Keep only what listing pages already stated; do not chase missing fields.",
-                ),
-                bool_opt(
-                    "no_follow",
-                    "Disable link following",
-                    false,
-                    "Do not queue outbound links from productive listing pages.",
-                ),
-                bool_opt(
                     "no_auto",
                     "Disable auto steering",
                     false,
                     "Use the fixed stopping rules instead of letting the judge steer depth.",
-                ),
-                bool_opt(
-                    "no_search_cache",
-                    "Disable search cache",
-                    false,
-                    "Do not read or write the on-disk cache of search responses.",
                 ),
                 int_opt(
                     "search_cache_ttl",
@@ -1046,7 +1077,7 @@ impl RunStore {
 /// A format that fails to render is omitted rather than faked; the download
 /// endpoint reports its absence instead of serving an error document that looks
 /// like data.
-fn render_all(report: &ScoutReport) -> BTreeMap<&'static str, String> {
+pub(crate) fn render_all(report: &ScoutReport) -> BTreeMap<&'static str, String> {
     let mut out = BTreeMap::new();
     for name in FORMATS {
         let Some(fmt) = parse_format(name) else {
@@ -1096,6 +1127,14 @@ pub struct AppState {
     pub planner_thinking_control: ThinkingControl,
     pub fetch_concurrency: usize,
     runs: Mutex<RunStore>,
+    /// The `/mcp` endpoint's token and searches. Disabled unless a token is set.
+    pub mcp: crate::mcp::McpState,
+    /// Built web UI to serve from this process (`--ui-dir`); `None` leaves the
+    /// UI to a separate server (the compose setup's nginx).
+    pub ui_dir: Option<std::path::PathBuf>,
+    /// The `Authorization` header every request but `/api/health` and `/mcp`
+    /// must carry (`--basic-auth`); `None` means no login.
+    pub basic_auth: Option<String>,
 }
 
 impl AppState {
@@ -1117,6 +1156,38 @@ impl AppState {
             planner_thinking_control,
             fetch_concurrency,
             runs: Mutex::new(RunStore::default()),
+            mcp: crate::mcp::McpState::new(None, crate::mcp::DEFAULT_MAX_RUNNING),
+            ui_dir: None,
+            basic_auth: None,
+        }
+    }
+
+    /// Serve the built UI from `dir` (see `ui_static`).
+    pub fn with_ui_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.ui_dir = dir;
+        self
+    }
+
+    /// Require `user:password` Basic auth (see `require_login`). Blank is off.
+    pub fn with_basic_auth(mut self, credentials: Option<String>) -> Self {
+        self.basic_auth = credentials
+            .map(|c| crate::config::unquote(&c).to_string())
+            .filter(|c| c.contains(':') && c.len() > 1)
+            .map(|c| basic_auth_header(&c));
+        self
+    }
+
+    /// Enable the MCP endpoint with this token (`None` keeps it disabled).
+    pub fn with_mcp(mut self, token: Option<String>, max_running: usize) -> Self {
+        self.mcp = crate::mcp::McpState::new(token, max_running);
+        self
+    }
+
+    /// Keep a finished run's renderings for the download endpoint.
+    pub(crate) fn store_run(&self, id: String, formats: BTreeMap<&'static str, String>) {
+        // Sync lock, sync body: never held across an await.
+        if let Ok(mut store) = self.runs.lock() {
+            store.insert(CompletedRun { id, formats });
         }
     }
 
@@ -1125,7 +1196,7 @@ impl AppState {
     /// Fresh clients every time, not clones: `Jev` and `Llm` share their counters
     /// through an `Arc`, so a cloned client would report the previous run's token
     /// spend as part of this one's.
-    fn build_scout(
+    pub(crate) fn build_scout(
         &self,
         opts: &RunOptions,
         tx: tokio::sync::mpsc::Sender<ProgressEvent>,
@@ -1292,6 +1363,20 @@ fn result_line(report: &ScoutReport, format: Format, content: &str) -> String {
         "outcome": report.outcome.as_str(),
         "format": format_name(format),
         "content": content,
+        // The same result taken apart, so a reader can lay it out in panels
+        // instead of scrolling one document: `body` is the answer prose or the
+        // records table with no frame, `sources` backs the answer's `[n]`
+        // citations in order, and `summary` says what the outcome means.
+        "kind": report.mission.kind,
+        "summary": crate::output::gloss(report),
+        "body": crate::output::markdown_body(report),
+        "sources": report.evidence.iter().map(|p| json!({
+            "url": p.url,
+            "title": p.title,
+            "supports": p.supports,
+        })).collect::<Vec<_>>(),
+        "quarantined": report.quarantined_sources,
+        "notes": report.notes,
         "stats": report.stats,
         "mission": report.mission,
     }))
@@ -1552,12 +1637,169 @@ async fn download(
         .into_response()
 }
 
+// ------------------------------------------------------------ web front --
+
+/// Standard base64 (RFC 4648, padded). Only ever encodes the configured
+/// `user:password` once at startup, to compare against the header a browser
+/// sends; a crate for eleven lines is not worth the dependency.
+fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for c in input.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// The exact `Authorization` header value a browser sends for `user:password`.
+pub(crate) fn basic_auth_header(credentials: &str) -> String {
+    format!("Basic {}", base64_encode(credentials.as_bytes()))
+}
+
+/// Paths that stay reachable without the Basic-auth login: the platform's
+/// health probe, and the MCP endpoint, which checks its own bearer token.
+fn auth_exempt(path: &str) -> bool {
+    path == "/api/health" || path == "/mcp"
+}
+
+/// Require the configured login on everything but `auth_exempt` paths.
+///
+/// A deployment on a public URL otherwise runs searches — billed to the
+/// server's Jev and LLM keys — for anyone who finds it. Off when
+/// `--basic-auth` / `WEBSCOUT_AUTH` is unset, which is right for a laptop or a
+/// private network and wrong for Railway or DigitalOcean.
+async fn require_login(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(expected) = &state.basic_auth else {
+        return next.run(req).await;
+    };
+    if auth_exempt(req.uri().path()) {
+        return next.run(req).await;
+    }
+    let got = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if crate::mcp::constant_time_eq(got.as_bytes(), expected.as_bytes()) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            "Basic realm=\"webscout\", charset=\"UTF-8\"",
+        )],
+        "login required",
+    )
+        .into_response()
+}
+
+fn content_type_of(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "woff2" => "font/woff2",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Resolve a request path to a file under the UI directory: the file itself,
+/// or `index.html` for an extensionless path (the single-page app's routes).
+/// `None` for anything that would leave the directory or name a dotfile.
+fn ui_file(dir: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    let rel = path.trim_start_matches('/');
+    if rel
+        .split('/')
+        .any(|seg| seg == ".." || seg.starts_with('.') || seg.contains('\\'))
+    {
+        return None;
+    }
+    let candidate = if rel.is_empty() {
+        dir.join("index.html")
+    } else {
+        dir.join(rel)
+    };
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    let last = rel.rsplit('/').next().unwrap_or("");
+    (!last.contains('.')).then(|| dir.join("index.html"))
+}
+
+/// Serve the built web UI when `--ui-dir` is set, so one container is the
+/// whole product (Railway, DigitalOcean). Unknown `/api/` paths stay JSON 404s.
+async fn ui_static(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Response {
+    let path = uri.path();
+    let Some(dir) = state.ui_dir.as_deref() else {
+        return json_error(StatusCode::NOT_FOUND, format!("no route for {path}"));
+    };
+    if path.starts_with("/api/") {
+        return json_error(StatusCode::NOT_FOUND, format!("no route for {path}"));
+    }
+    let Some(file) = ui_file(dir, path) else {
+        return json_error(StatusCode::NOT_FOUND, "not found");
+    };
+    match std::fs::read(&file) {
+        Ok(bytes) => {
+            // Vite fingerprints everything under assets/; the page itself must
+            // be re-read so a deploy's new asset names are picked up.
+            let cache = if path.starts_with("/assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache"
+            };
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, content_type_of(&file)),
+                    (header::CACHE_CONTROL, cache),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => json_error(StatusCode::NOT_FOUND, "not found"),
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/options", get(options_handler))
         .route("/api/search", post(search))
         .route("/api/runs/{run_id}/download", get(download))
+        .route("/api/mcp", get(crate::mcp::info))
+        .route("/mcp", post(crate::mcp::handle).get(crate::mcp::no_stream))
+        .fallback(ui_static)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_login,
+        ))
         .with_state(state)
 }
 
@@ -1567,9 +1809,21 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// from a sibling service; the compose file is what decides whether anything
 /// outside the host network can see it.
 pub async fn serve(port: u16, state: AppState) -> Result<()> {
+    let app_mcp_enabled = state.mcp.enabled();
+    if let Some(dir) = &state.ui_dir {
+        tracing::info!(dir = %dir.display(), "serving the web UI");
+    }
+    if state.basic_auth.is_some() {
+        tracing::info!("login required for the UI and /api (except /api/health)");
+    }
     let app = router(Arc::new(state));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "api listening on 0.0.0.0:{port}");
+    if app_mcp_enabled {
+        tracing::info!("mcp endpoint enabled at /mcp (bearer token required)");
+    } else {
+        tracing::warn!("mcp endpoint disabled: set WEBSCOUT_MCP_TOKEN to enable /mcp");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1662,8 +1916,10 @@ mod tests {
     // --- catalogue ---
 
     /// Every option the shared API contract names, in the group it names.
-    const SPEC_BASIC: [&str; 4] = ["preset", "max_rounds", "format", "search_engines"];
-    const SPEC_ADVANCED: [&str; 27] = [
+    const SPEC_BASIC: [&str; 2] = ["preset", "format"];
+    const SPEC_ADVANCED: [&str; 4] = ["max_rounds", "no_enrich", "no_follow", "no_search_cache"];
+    const SPEC_EXPERT: [&str; 25] = [
+        "search_engines",
         "queries_per_round",
         "results_per_query",
         "read_per_query",
@@ -1682,10 +1938,7 @@ mod tests {
         "enrich_read",
         "max_follow_per_page",
         "no_plan",
-        "no_enrich",
-        "no_follow",
         "no_auto",
-        "no_search_cache",
         "search_cache_ttl",
         "llm_model",
         "planner_model",
@@ -1694,10 +1947,10 @@ mod tests {
     ];
 
     #[test]
-    fn catalogue_has_the_two_contract_groups() {
+    fn catalogue_has_the_three_contract_groups() {
         let groups = catalogue();
         let ids: Vec<&str> = groups.iter().map(|g| g.id).collect();
-        assert_eq!(ids, vec!["basic", "advanced"]);
+        assert_eq!(ids, vec!["basic", "advanced", "expert"]);
     }
 
     #[test]
@@ -1705,6 +1958,10 @@ mod tests {
         let groups = catalogue();
         let basic: Vec<&str> = groups[0].options.iter().map(|o| o.name).collect();
         let advanced: Vec<&str> = groups[1].options.iter().map(|o| o.name).collect();
+        let expert: Vec<&str> = groups[2].options.iter().map(|o| o.name).collect();
+        for name in SPEC_EXPERT {
+            assert!(expert.contains(&name), "expert group is missing {name}");
+        }
         for name in SPEC_BASIC {
             assert!(basic.contains(&name), "basic group is missing {name}");
         }
@@ -1741,6 +1998,9 @@ mod tests {
                 }
                 let values = opt.values.clone().unwrap_or_default();
                 assert!(!values.is_empty(), "{} lists no values", opt.name);
+                if let Some(labels) = &opt.value_labels {
+                    assert_eq!(labels.len(), values.len(), "{} labels", opt.name);
+                }
                 let default = opt.default.as_str().unwrap_or_default();
                 assert!(
                     values.contains(&default),
@@ -1854,7 +2114,7 @@ mod tests {
         assert!(first["label"].is_string());
         assert!(first["type"].is_string());
         assert!(first["help"].is_string());
-        assert!(v["groups"][1]["options"].as_array().unwrap().len() > 10);
+        assert!(v["groups"][2]["options"].as_array().unwrap().len() > 10);
     }
 
     // --- validation ---
@@ -2329,6 +2589,200 @@ mod tests {
             .unwrap()
     }
 
+    // --- web front ---
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(basic_auth_header("user:pass"), "Basic dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn ui_file_serves_files_falls_back_to_index_and_refuses_escapes() {
+        let dir = std::env::temp_dir().join(format!("ws-ui-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("index.html"), "<html>").unwrap();
+        std::fs::write(dir.join("assets/app.js"), "x").unwrap();
+        assert_eq!(ui_file(&dir, "/"), Some(dir.join("index.html")));
+        assert_eq!(
+            ui_file(&dir, "/assets/app.js"),
+            Some(dir.join("assets/app.js"))
+        );
+        assert_eq!(ui_file(&dir, "/some/route"), Some(dir.join("index.html")));
+        assert_eq!(ui_file(&dir, "/missing.js"), None);
+        assert_eq!(ui_file(&dir, "/../etc/passwd"), None);
+        assert_eq!(ui_file(&dir, "/.env"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn login_guards_everything_but_health_and_mcp() {
+        let st = Arc::try_unwrap(test_state()).ok().expect("fresh state");
+        let st = Arc::new(st.with_basic_auth(Some("admin:s3cret".into())));
+        let (status, _) = call(st.clone(), get("/api/options")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = call(st.clone(), get("/api/health")).await;
+        assert_eq!(status, StatusCode::OK);
+        // /mcp answers with its own verdict (disabled here), not the login's.
+        let (status, _) = call(
+            st.clone(),
+            post_json("/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let req = axum::http::Request::builder()
+            .uri("/api/options")
+            .header("authorization", basic_auth_header("admin:s3cret"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(st, req).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn without_a_login_configured_everything_is_open() {
+        let (status, _) = call(test_state(), get("/api/options")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(test_state(), get("/api/nope")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("no route"), "{body}");
+    }
+
+    // --- MCP endpoint ---
+
+    fn mcp_state(token: Option<&str>) -> Arc<AppState> {
+        let st = Arc::try_unwrap(test_state()).ok().expect("fresh state");
+        Arc::new(st.with_mcp(token.map(str::to_string), 2))
+    }
+
+    fn mcp_post(token: Option<&str>, body: &str) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+
+    #[tokio::test]
+    async fn mcp_without_a_configured_token_refuses_everything() {
+        let (status, body) = call(mcp_state(None), mcp_post(Some("x"), INIT)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("WEBSCOUT_MCP_TOKEN"), "{body}");
+        let (_, info) = call(mcp_state(None), get("/api/mcp")).await;
+        assert!(info.contains("\"enabled\":false"), "{info}");
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_a_missing_or_wrong_token() {
+        let (status, _) = call(mcp_state(Some("s3cret")), mcp_post(None, INIT)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = call(mcp_state(Some("s3cret")), mcp_post(Some("nope"), INIT)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_initializes_lists_tools_and_acks_notifications() {
+        let st = mcp_state(Some("s3cret"));
+        let (status, body) = call(st.clone(), mcp_post(Some("s3cret"), INIT)).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
+        assert!(
+            v["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("start_search")
+        );
+
+        let (status, body) = call(
+            st.clone(),
+            mcp_post(
+                Some("s3cret"),
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.is_empty());
+
+        let (_, body) = call(
+            st.clone(),
+            mcp_post(
+                Some("s3cret"),
+                r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#,
+            ),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["id"], "a");
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 7);
+
+        let (_, body) = call(
+            st,
+            mcp_post(
+                Some("s3cret"),
+                r#"{"jsonrpc":"2.0","id":2,"method":"no/such"}"#,
+            ),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_errors_are_readable_results_not_protocol_errors() {
+        let st = mcp_state(Some("s3cret"));
+        let call_tool = |args: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"start_search","arguments":{args}}}}}"#
+            )
+        };
+        // An unknown option is named back to the model.
+        let (_, body) = call(
+            st.clone(),
+            mcp_post(Some("s3cret"), &call_tool(r#"{"query":"x","llm_key":"k"}"#)),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["isError"], true, "{body}");
+        assert!(body.contains("llm_key"), "{body}");
+
+        // An unknown request id is a readable miss.
+        let (_, body) = call(
+            st.clone(),
+            mcp_post(
+                Some("s3cret"),
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_search_result","arguments":{"request_id":"nope","wait_seconds":0}}}"#,
+            ),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+
+        // A batch answers each request and skips the notification.
+        let (_, body) = call(
+            st,
+            mcp_post(
+                Some("s3cret"),
+                r#"[{"jsonrpc":"2.0","id":5,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"}]"#,
+            ),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn health_reports_ok_and_the_crate_version() {
         let (status, body) = call(test_state(), get("/api/health")).await;
@@ -2344,7 +2798,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let v: Value = serde_json::from_str(&body).unwrap();
         let groups = v["groups"].as_array().unwrap();
-        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.len(), 3);
         for group in groups {
             for opt in group["options"].as_array().unwrap() {
                 assert!(!opt["help"].as_str().unwrap().is_empty());

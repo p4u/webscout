@@ -51,10 +51,24 @@ service.
 
 - **Options are not hardcoded.** On load the UI fetches `GET /api/options` and renders
   every control from the returned schema: the `basic` group as chips under the search
-  field, the `advanced` group inside a collapsed disclosure, each option laid out by
-  its `type` (`integer`/`number` → number input honouring `min`/`max`, `boolean` →
-  switch, `enum` → select, `string` → text). An option added to the API appears here
-  with no change to this code.
+  field, the `advanced` group inside the collapsed "More options" disclosure, each
+  option laid out by its `type` (`integer`/`number` → number input honouring
+  `min`/`max`, `boolean` → switch, `enum` → select showing `value_labels` when given,
+  `string` → text). The `expert` group (thresholds, batch sizes, concurrency, models)
+  is not rendered: those knobs are for API callers, and a person running a search has
+  no reason to touch them. An option added to `basic` or `advanced` appears here with
+  no change to this code.
+- **The reply is its own card.** The `result` event carries the result taken apart:
+  `body` (the answer prose or the records table, no frame), `summary` (what the
+  outcome means), `sources` (backing the answer's `[n]` citations, in order),
+  `quarantined` and `notes`. The body is shown in a raised card; each `[n]` becomes a
+  numbered badge that opens the sources box at that page. Sources sit in a separate
+  box, hidden until "Show sources" is pressed. Non-markdown formats show the full
+  document as an escaped code block instead.
+- **Examples & help.** A dialog lists example questions for each kind of request
+  (quick facts, current information, yes-or-no checks, lists, comparisons, history);
+  picking one fills the search field without running it. Examples live in
+  `src/examples.js`.
 - **Only changed options are sent.** `POST /api/search` carries the query plus the
   options that differ from their schema default. "Reset to defaults" clears them, and
   a badge on the disclosure counts how many are set.
@@ -63,8 +77,9 @@ service.
   `progress` events become a timestamped activity log, `stats` feed the counters, and
   the `result` event ends the run. Stop aborts through an `AbortController`, which
   drops the connection and so aborts the run server-side.
-- **Tokens and cost are visible while they are being spent.** The API sends a `usage`
-  event about once a second; the panel under the activity log shows requests and
+- **Tokens and cost are available, not imposed.** The panel is hidden until "Show
+  tokens & cost" in the activity bar is pressed (remembered in `localStorage`). The
+  API sends a `usage` event about once a second; the panel shows requests and
   tokens for Jev, the writer and the planner, plus a running total in USD. It appears
   at zero the moment a run starts and settles on the finished run's own stats, so the
   final numbers are the same ones the `result` event carries. The planner row is
@@ -77,6 +92,10 @@ service.
   and event-handler attributes are stripped, and every link is forced to
   `target="_blank" rel="noopener noreferrer"`. Non-markdown formats (json, csv, jsonl)
   are shown as escaped code blocks, never parsed as markup.
+- **Connect AI tools.** A dialog shows the MCP address (`<this page's origin>/mcp`),
+  whether the server has MCP enabled (`GET /api/mcp`), and setup snippets for Claude
+  Code, opencode, pi and others. A pasted token fills in the snippets; it stays in the
+  page and is never sent anywhere or stored.
 - **Every failure is visible.** An `error` event, a non-200, a dropped connection, a
   malformed NDJSON line and an unhandled rejection all land in the same inline panel
   with a retry button. There is no state that renders a blank page.
@@ -89,6 +108,8 @@ service.
 | `src/main.js` | App controller: run lifecycle, streaming, result rendering, errors |
 | `src/api.js` | `GET /api/options`, the NDJSON `POST /api/search` generator, download URLs |
 | `src/options.js` | Generic control rendering from the options schema, dirty tracking |
+| `src/examples.js` | The help dialog's example questions and tips |
+| `src/connect.js` | The "Connect AI tools" dialog: MCP URL and per-client setup snippets |
 | `src/markdown.js` | `marked` + DOMPurify, link hardening, table wrapping |
 | `src/styles.css` | All styling; one accent colour, design tokens at the top |
 
