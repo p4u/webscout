@@ -22,6 +22,8 @@ ui/dist/
 # it up.
 env
 .env
+.env.*
+!.env.example
 *-api-key.txt
 *.pem
 *.key
