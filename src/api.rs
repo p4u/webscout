@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,7 +30,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
@@ -208,7 +208,7 @@ pub(crate) fn new_run_id() -> String {
 ///
 /// Reuses the calendar arithmetic already in `clock`, for the same reason that
 /// module exists: four lines of integer maths is not worth a date crate.
-fn rfc3339(secs: u64) -> String {
+pub(crate) fn rfc3339(secs: u64) -> String {
     let day = crate::clock::format_civil(crate::clock::civil_from_days((secs / 86_400) as i64));
     let rem = secs % 86_400;
     format!(
@@ -219,13 +219,16 @@ fn rfc3339(secs: u64) -> String {
     )
 }
 
+/// Seconds since the Unix epoch; 0 for a clock set before it.
+pub(crate) fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub(crate) fn now_rfc3339() -> String {
-    rfc3339(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    )
+    rfc3339(unix_now())
 }
 
 // --------------------------------------------------------------- presets --
@@ -1132,9 +1135,16 @@ pub struct AppState {
     /// Built web UI to serve from this process (`--ui-dir`); `None` leaves the
     /// UI to a separate server (the compose setup's nginx).
     pub ui_dir: Option<std::path::PathBuf>,
-    /// The `Authorization` header every request but `/api/health` and `/mcp`
-    /// must carry (`--basic-auth`); `None` means no login.
-    pub basic_auth: Option<String>,
+    /// The UI's password and login sessions (`--password`); no password
+    /// means no login.
+    pub(crate) auth: crate::auth::Auth,
+    /// Every finished run, for `/api/stats`. In memory only until
+    /// `with_data_dir` names a place for the log.
+    pub(crate) stats: crate::stats::StatsStore,
+    /// UI searches whose run is still going, for `running_now`.
+    ui_in_flight: AtomicUsize,
+    /// When this process started serving, Unix seconds.
+    started_at: u64,
 }
 
 impl AppState {
@@ -1158,7 +1168,10 @@ impl AppState {
             runs: Mutex::new(RunStore::default()),
             mcp: crate::mcp::McpState::new(None, crate::mcp::DEFAULT_MAX_RUNNING),
             ui_dir: None,
-            basic_auth: None,
+            auth: crate::auth::Auth::default(),
+            stats: crate::stats::StatsStore::default(),
+            ui_in_flight: AtomicUsize::new(0),
+            started_at: unix_now(),
         }
     }
 
@@ -1168,12 +1181,23 @@ impl AppState {
         self
     }
 
-    /// Require `user:password` Basic auth (see `require_login`). Blank is off.
-    pub fn with_basic_auth(mut self, credentials: Option<String>) -> Self {
-        self.basic_auth = credentials
-            .map(|c| crate::config::unquote(&c).to_string())
-            .filter(|c| c.contains(':') && c.len() > 1)
-            .map(|c| basic_auth_header(&c));
+    /// Require this password to use the UI and `/api` (see `require_login`).
+    /// Unset or blank is no login.
+    pub fn with_password(mut self, password: Option<String>) -> Self {
+        self.auth = crate::auth::Auth::new(password);
+        self
+    }
+
+    /// Keep the run log in `dir` (loading what is already there); `None`
+    /// keeps it in memory only.
+    pub fn with_data_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.stats = match dir {
+            Some(d) => crate::stats::StatsStore::open(&d),
+            None => {
+                tracing::warn!("no data directory: the run log is kept in memory only");
+                crate::stats::StatsStore::default()
+            }
+        };
         self
     }
 
@@ -1181,6 +1205,11 @@ impl AppState {
     pub fn with_mcp(mut self, token: Option<String>, max_running: usize) -> Self {
         self.mcp = crate::mcp::McpState::new(token, max_running);
         self
+    }
+
+    /// UI streams and MCP searches whose run is still going.
+    pub(crate) fn running_now(&self) -> usize {
+        self.ui_in_flight.load(Ordering::Relaxed) + self.mcp.running()
     }
 
     /// Keep a finished run's renderings for the download endpoint.
@@ -1432,6 +1461,36 @@ struct StreamState {
     usage_tick: tokio::time::Interval,
     /// Wall clock for `usage.elapsed_ms` before the report exists to supply it.
     started: std::time::Instant,
+    /// The run's log entry as known at the start; completed and appended to
+    /// the run log when the run ends, however it ends (see `Drop`).
+    record: crate::stats::RunRecord,
+}
+
+impl StreamState {
+    /// The run is over: it no longer counts towards `running_now`.
+    fn settle(&mut self) {
+        self.fut = None;
+        self.store.ui_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A stream dropped while its run is still pending is a cancelled run: the
+/// client disconnected (closed the tab, pressed stop). It is logged here
+/// because nothing else sees it — the run future is dropped with this state,
+/// mid-await, and never returns.
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if self.fut.is_none() {
+            return;
+        }
+        self.store.ui_in_flight.fetch_sub(1, Ordering::Relaxed);
+        let usage = UsageSnapshot::sample(&self.scout);
+        let ms = self.started.elapsed().as_millis() as u64;
+        tracing::info!(run_id = %self.run_id, "api run cancelled by the client");
+        self.store
+            .stats
+            .append(std::mem::take(&mut self.record).cancelled(ms, &usage));
+    }
 }
 
 async fn search(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
@@ -1482,6 +1541,9 @@ async fn search(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let mut usage_tick = tokio::time::interval(USAGE_INTERVAL);
     usage_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let record = crate::stats::RunRecord::begin(&run_id, &query, "ui", opts.preset.as_str());
+    // Counted from here on; `settle` or `Drop` gives it back, exactly once.
+    state.ui_in_flight.fetch_add(1, Ordering::Relaxed);
     let st = StreamState {
         rx,
         fut: Some(fut),
@@ -1492,6 +1554,7 @@ async fn search(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         scout,
         usage_tick,
         started: std::time::Instant::now(),
+        record,
     };
 
     let stream = futures::stream::unfold(st, |mut st| async move {
@@ -1524,7 +1587,7 @@ async fn search(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
             };
 
             let Some(res) = done else { continue };
-            st.fut = None;
+            st.settle();
 
             // Drain whatever the run emitted while we were awaiting its result, so
             // the story is complete before the ending is told.
@@ -1555,14 +1618,17 @@ async fn search(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
                         });
                     }
                     tracing::info!(run_id = %st.run_id, outcome = report.outcome.as_str(), "api run finished");
+                    let rec = std::mem::take(&mut st.record).finished(&report);
+                    st.store.stats.append(rec);
                 }
                 Err(e) => {
                     tracing::warn!(run_id = %st.run_id, error = %e, "api run failed");
                     // A failed run still spent money; report it before the error.
-                    st.pending.push_back(usage_line(
-                        &UsageSnapshot::sample(&st.scout),
-                        st.started.elapsed().as_millis() as u64,
-                    ));
+                    let usage = UsageSnapshot::sample(&st.scout);
+                    let ms = st.started.elapsed().as_millis() as u64;
+                    st.pending.push_back(usage_line(&usage, ms));
+                    let rec = std::mem::take(&mut st.record).failed(&e.to_string(), ms, &usage);
+                    st.store.stats.append(rec);
                     st.pending.push_back(ndjson_line(
                         &json!({"type": "error", "message": e.to_string()}),
                     ));
@@ -1639,77 +1705,164 @@ async fn download(
 
 // ------------------------------------------------------------ web front --
 
-/// Standard base64 (RFC 4648, padded). Only ever encodes the configured
-/// `user:password` once at startup, to compare against the header a browser
-/// sends; a crate for eleven lines is not worth the dependency.
-fn base64_encode(input: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for c in input.chunks(3) {
-        let n = (u32::from(c[0]) << 16)
-            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*c.get(2).unwrap_or(&0));
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if c.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// The exact `Authorization` header value a browser sends for `user:password`.
-pub(crate) fn basic_auth_header(credentials: &str) -> String {
-    format!("Basic {}", base64_encode(credentials.as_bytes()))
-}
-
-/// Paths that stay reachable without the Basic-auth login: the platform's
-/// health probe, and the MCP endpoint, which checks its own bearer token.
+/// Paths under `/api/` that stay open when a password is set: the platform's
+/// health probe, and the two calls the login page itself needs. Everything
+/// outside `/api/` is open too — the static UI must load for the login form
+/// to show, and `/mcp` checks its own bearer token.
 fn auth_exempt(path: &str) -> bool {
-    path == "/api/health" || path == "/mcp"
+    !path.starts_with("/api/") || matches!(path, "/api/health" | "/api/session" | "/api/login")
 }
 
-/// Require the configured login on everything but `auth_exempt` paths.
+fn auth_error(status: StatusCode, error: &str, message: &str) -> Response {
+    (status, Json(json!({"error": error, "message": message}))).into_response()
+}
+
+/// Require a login session on every `/api/` path but the `auth_exempt` ones.
 ///
 /// A deployment on a public URL otherwise runs searches — billed to the
 /// server's Jev and LLM keys — for anyone who finds it. Off when
-/// `--basic-auth` / `WEBSCOUT_AUTH` is unset, which is right for a laptop or a
-/// private network and wrong for Railway or DigitalOcean.
+/// `--password` / `WEBSCOUT_PASSWORD` is unset, which is right for a laptop or
+/// a private network and wrong for Railway or DigitalOcean.
 async fn require_login(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Some(expected) = &state.basic_auth else {
+    if !state.auth.required()
+        || auth_exempt(req.uri().path())
+        || state.auth.authenticated(req.headers())
+    {
         return next.run(req).await;
+    }
+    auth_error(StatusCode::UNAUTHORIZED, "login_required", "Log in first.")
+}
+
+/// `GET /api/session`: whether a login is needed and whether this browser
+/// has one. Always open, so the UI can decide what to show first.
+async fn session(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let required = state.auth.required();
+    Json(json!({
+        "auth_required": required,
+        "authenticated": !required || state.auth.authenticated(&headers),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    #[serde(default)]
+    password: String,
+}
+
+/// `POST /api/login`: trade the password for a session cookie.
+async fn login(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    let req: LoginRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return auth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {e}"),
+            );
+        }
     };
-    if auth_exempt(req.uri().path()) {
-        return next.run(req).await;
+    match state.auth.login(&req.password) {
+        Ok(crate::auth::Login::Open) => Json(json!({"ok": true})).into_response(),
+        Ok(crate::auth::Login::Ok(token)) => {
+            let cookie = crate::auth::session_cookie(&token, crate::auth::over_https(&headers));
+            (
+                StatusCode::OK,
+                [(header::SET_COOKIE, cookie)],
+                Json(json!({"ok": true})),
+            )
+                .into_response()
+        }
+        Ok(crate::auth::Login::Wrong) => {
+            tracing::warn!("wrong password at /api/login");
+            // Paid by the guesser, after the failure is counted and with no
+            // lock held, so concurrent guesses are each slowed and all counted.
+            tokio::time::sleep(state.auth.failure_delay).await;
+            auth_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_password",
+                "Wrong password.",
+            )
+        }
+        Ok(crate::auth::Login::Throttled) => auth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_attempts",
+            "Too many attempts; wait a minute.",
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "could not create a session token");
+            auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_unavailable",
+                "Could not start a session.",
+            )
+        }
     }
-    let got = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if crate::mcp::constant_time_eq(got.as_bytes(), expected.as_bytes()) {
-        return next.run(req).await;
-    }
+}
+
+/// `POST /api/logout`: close the session server-side and clear the cookie.
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    state.auth.logout(&headers);
     (
-        StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            "Basic realm=\"webscout\", charset=\"UTF-8\"",
-        )],
-        "login required",
+        StatusCode::OK,
+        [(header::SET_COOKIE, crate::auth::clear_cookie())],
+        Json(json!({"ok": true})),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    bucket: Option<String>,
+    days: Option<String>,
+}
+
+/// `GET /api/stats`: the run log, aggregated over a range.
+async fn stats_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StatsQuery>,
+) -> Response {
+    let bucket = match q.bucket.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        None => crate::stats::Bucket::Day,
+        Some(b) => match crate::stats::Bucket::parse(b) {
+            Some(b) => b,
+            None => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown bucket \"{b}\"; expected hour, day or week"),
+                );
+            }
+        },
+    };
+    let days = match q.days.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        None => 30,
+        Some(d) => match d.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("days must be a whole number; got \"{d}\""),
+                );
+            }
+        },
+    };
+    let days = crate::stats::clamp_days(bucket, days);
+    let now = unix_now();
+    let mut body = state
+        .stats
+        .with_records(|r| crate::stats::aggregate(r, now, bucket, days));
+    body["server"] = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "started_at": rfc3339(state.started_at),
+        "uptime_secs": now.saturating_sub(state.started_at),
+        "running_now": state.running_now(),
+        "mcp_enabled": state.mcp.enabled(),
+    });
+    Json(body).into_response()
 }
 
 fn content_type_of(path: &std::path::Path) -> &'static str {
@@ -1794,6 +1947,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/search", post(search))
         .route("/api/runs/{run_id}/download", get(download))
         .route("/api/mcp", get(crate::mcp::info))
+        .route("/api/session", get(session))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .route("/api/stats", get(stats_handler))
         .route("/mcp", post(crate::mcp::handle).get(crate::mcp::no_stream))
         .fallback(ui_static)
         .layer(axum::middleware::from_fn_with_state(
@@ -1813,8 +1970,12 @@ pub async fn serve(port: u16, state: AppState) -> Result<()> {
     if let Some(dir) = &state.ui_dir {
         tracing::info!(dir = %dir.display(), "serving the web UI");
     }
-    if state.basic_auth.is_some() {
-        tracing::info!("login required for the UI and /api (except /api/health)");
+    if state.auth.required() {
+        tracing::info!("password login required for /api (except /api/health)");
+    } else {
+        tracing::warn!(
+            "no password set: the UI and /api are open; set WEBSCOUT_PASSWORD on any public deployment"
+        );
     }
     let app = router(Arc::new(state));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
@@ -2592,16 +2753,6 @@ mod tests {
     // --- web front ---
 
     #[test]
-    fn base64_matches_rfc4648_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(basic_auth_header("user:pass"), "Basic dXNlcjpwYXNz");
-    }
-
-    #[test]
     fn ui_file_serves_files_falls_back_to_index_and_refuses_escapes() {
         let dir = std::env::temp_dir().join(format!("ws-ui-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("assets")).unwrap();
@@ -2619,28 +2770,262 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn login_guards_everything_but_health_and_mcp() {
+    /// A password-protected state whose wrong-password delay is zero, so the
+    /// rate-limit test does not sleep through ten failures.
+    fn locked_state(mcp_token: Option<&str>) -> Arc<AppState> {
         let st = Arc::try_unwrap(test_state()).ok().expect("fresh state");
-        let st = Arc::new(st.with_basic_auth(Some("admin:s3cret".into())));
-        let (status, _) = call(st.clone(), get("/api/options")).await;
+        let mut st = st
+            .with_mcp(mcp_token.map(str::to_string), 2)
+            .with_password(Some("s3cret".into()));
+        st.auth.failure_delay = Duration::ZERO;
+        Arc::new(st)
+    }
+
+    /// Send a request, returning status, the `Set-Cookie` header and the body.
+    async fn call_full(
+        state: Arc<AppState>,
+        req: axum::http::Request<Body>,
+    ) -> (StatusCode, Option<String>, String) {
+        use tower::ServiceExt;
+        let res = router(state).oneshot(req).await.expect("router call");
+        let status = res.status();
+        let cookie = res
+            .headers()
+            .get(header::SET_COOKIE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, cookie, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn with_cookie(mut req: axum::http::Request<Body>, cookie: &str) -> axum::http::Request<Body> {
+        req.headers_mut()
+            .insert(header::COOKIE, cookie.parse().unwrap());
+        req
+    }
+
+    /// Log in and return the `name=value` pair a browser would send back.
+    async fn log_in(st: &Arc<AppState>) -> String {
+        let (status, cookie, _) = call_full(
+            st.clone(),
+            post_json("/api/login", r#"{"password":"s3cret"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        cookie
+            .expect("a session cookie")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_password_guards_the_api_but_not_health_session_login_ui_or_mcp() {
+        let st = locked_state(None);
+        let (status, body) = call(st.clone(), get("/api/options")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "login_required");
+        assert_eq!(v["message"], "Log in first.");
+        for path in ["/api/stats", "/api/mcp", "/api/runs/x/download"] {
+            let (status, _) = call(st.clone(), get(path)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        }
+        let (status, _) = call(st.clone(), post_json("/api/search", "{}")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
         let (status, _) = call(st.clone(), get("/api/health")).await;
         assert_eq!(status, StatusCode::OK);
-        // /mcp answers with its own verdict (disabled here), not the login's.
+        let (status, body) = call(st.clone(), get("/api/session")).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["auth_required"], true);
+        assert_eq!(v["authenticated"], false);
+        // Static paths fall through to the UI handler (no UI dir here: 404,
+        // not 401), and /mcp answers with its own verdict (disabled: 503).
+        let (status, _) = call(st.clone(), get("/index.html")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = call(
             st.clone(),
             post_json("/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        let req = axum::http::Request::builder()
-            .uri("/api/options")
-            .header("authorization", basic_auth_header("admin:s3cret"))
-            .body(Body::empty())
-            .unwrap();
-        let (status, _) = call(st, req).await;
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_is_401_and_sets_no_cookie() {
+        let st = locked_state(None);
+        let (status, cookie, body) = call_full(
+            st.clone(),
+            post_json("/api/login", r#"{"password":"nope"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(cookie.is_none());
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "invalid_password");
+        assert_eq!(v["message"], "Wrong password.");
+        let (status, _, _) = call_full(st, post_json("/api/login", "{not json")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn logging_in_opens_the_api_and_logging_out_closes_it() {
+        let st = locked_state(None);
+        let (status, cookie, body) = call_full(
+            st.clone(),
+            post_json("/api/login", r#"{"password":"s3cret"}"#),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"ok":true}"#);
+        let cookie = cookie.unwrap();
+        assert!(cookie.starts_with("webscout_session="), "{cookie}");
+        assert!(
+            cookie.ends_with("; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000"),
+            "{cookie}"
+        );
+        let pair = cookie.split(';').next().unwrap().to_string();
+        assert_eq!(pair.len(), "webscout_session=".len() + 64);
+
+        // Among other cookies, as a browser sends it.
+        let jar = format!("theme=dark; {pair}; lang=ca");
+        let (status, _) = call(st.clone(), with_cookie(get("/api/options"), &jar)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = call(st.clone(), with_cookie(get("/api/session"), &jar)).await;
+        assert!(body.contains(r#""authenticated":true"#), "{body}");
+        let (status, _) = call(
+            st.clone(),
+            with_cookie(get("/api/options"), "webscout_session=forged"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, cleared, _) =
+            call_full(st.clone(), with_cookie(post_json("/api/logout", ""), &jar)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            cleared.as_deref(),
+            Some("webscout_session=; Max-Age=0; Path=/")
+        );
+        let (status, _) = call(st.clone(), with_cookie(get("/api/options"), &jar)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the session is gone server-side"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cookie_is_secure_only_behind_https() {
+        let st = locked_state(None);
+        let mut req = post_json("/api/login", r#"{"password":"s3cret"}"#);
+        req.headers_mut()
+            .insert("x-forwarded-proto", "https".parse().unwrap());
+        let (_, cookie, _) = call_full(st, req).await;
+        assert!(cookie.unwrap().ends_with("; Secure"));
+    }
+
+    #[tokio::test]
+    async fn eleven_attempts_a_minute_is_one_too_many() {
+        let st = locked_state(None);
+        for _ in 0..crate::auth::MAX_FAILURES {
+            let (status, _) =
+                call(st.clone(), post_json("/api/login", r#"{"password":"x"}"#)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let (status, body) = call(
+            st.clone(),
+            post_json("/api/login", r#"{"password":"s3cret"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "too_many_attempts");
+        assert_eq!(v["message"], "Too many attempts; wait a minute.");
+    }
+
+    #[tokio::test]
+    async fn without_a_password_login_is_a_no_op_and_session_says_open() {
+        let (status, cookie, body) = call_full(
+            test_state(),
+            post_json("/api/login", r#"{"password":"anything"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(cookie.is_none());
+        assert_eq!(body, r#"{"ok":true}"#);
+        let (_, body) = call(test_state(), get("/api/session")).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["auth_required"], false);
+        assert_eq!(v["authenticated"], true);
+    }
+
+    #[tokio::test]
+    async fn the_mcp_token_is_shown_only_to_a_logged_in_user_of_a_protected_server() {
+        // Open server: never, even though the MCP endpoint is on.
+        let (_, body) = call(mcp_state(Some("tok-123")), get("/api/mcp")).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert!(v.get("token").is_none(), "{body}");
+
+        // Protected server, logged in: yes.
+        let st = locked_state(Some("tok-123"));
+        let jar = log_in(&st).await;
+        let (status, body) = call(st.clone(), with_cookie(get("/api/mcp"), &jar)).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["token"], "tok-123");
+
+        // Protected server, MCP disabled: nothing to show.
+        let st = locked_state(None);
+        let jar = log_in(&st).await;
+        let (_, body) = call(st, with_cookie(get("/api/mcp"), &jar)).await;
+        assert!(!body.contains("token\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn stats_serves_the_contract_shape_and_validates_its_query() {
+        let st = test_state();
+        let mut rec = crate::stats::RunRecord::begin("r1", "who", "ui", "quick");
+        rec.outcome = "complete".into();
+        rec.kind = "answer".into();
+        st.stats.append(rec);
+        let (status, body) = call(st.clone(), get("/api/stats?bucket=hour&days=30")).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["range"]["bucket"], "hour");
+        assert_eq!(v["range"]["days"], 7, "hourly ranges are capped at a week");
+        assert_eq!(v["series"].as_array().unwrap().len(), 7 * 24);
+        assert_eq!(v["totals"]["runs"], 1);
+        assert_eq!(v["by_preset"]["quick"], 1);
+        assert_eq!(v["server"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["server"]["running_now"], 0);
+        assert_eq!(v["server"]["mcp_enabled"], false);
+        for k in [
+            "generated_at",
+            "totals",
+            "cost",
+            "tokens",
+            "by_kind",
+            "recent",
+            "all_time",
+        ] {
+            assert!(v.get(k).is_some(), "missing {k}");
+        }
+
+        let (_, body) = call(st.clone(), get("/api/stats")).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["range"]["bucket"], "day");
+        assert_eq!(v["range"]["days"], 30);
+
+        let (status, _) = call(st.clone(), get("/api/stats?bucket=month")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(st, get("/api/stats?days=lots")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

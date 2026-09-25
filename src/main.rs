@@ -12,6 +12,7 @@
 //! verbosity.
 
 mod api;
+mod auth;
 mod browser;
 mod candidates;
 mod clock;
@@ -21,6 +22,7 @@ mod mcp;
 mod output;
 mod scout;
 mod search_cache;
+mod stats;
 mod types;
 mod typesafe;
 
@@ -98,17 +100,24 @@ struct Cli {
     #[arg(long, value_name = "DIR", env = "WEBSCOUT_UI_DIR")]
     ui_dir: Option<std::path::PathBuf>,
 
-    /// Require this `user:password` login (HTTP Basic) for the UI and the
-    /// HTTP API — everything except /api/health and /mcp, which has its own
+    /// Require this password to use the web UI and the HTTP API — every /api
+    /// path except /api/health, /api/session and /api/login. The UI shows a
+    /// login page and keeps a 30-day session cookie. /mcp keeps its own
     /// token. Set it on any public deployment: searches are billed to the
-    /// server's keys. Falls back to $WEBSCOUT_AUTH.
+    /// server's keys. Falls back to $WEBSCOUT_PASSWORD.
     #[arg(
         long,
-        value_name = "USER:PASSWORD",
-        env = "WEBSCOUT_AUTH",
+        value_name = "PASSWORD",
+        env = "WEBSCOUT_PASSWORD",
         hide_env_values = true
     )]
-    basic_auth: Option<String>,
+    password: Option<String>,
+
+    /// Directory for the API server's run log (`runs.jsonl`), which the
+    /// statistics page reads. Falls back to $WEBSCOUT_DATA_DIR, then
+    /// $XDG_DATA_HOME/webscout, then ~/.local/share/webscout.
+    #[arg(long, value_name = "DIR", env = "WEBSCOUT_DATA_DIR")]
+    data_dir: Option<String>,
 
     /// Most MCP searches allowed to run at once. Falls back to
     /// $WEBSCOUT_MCP_MAX_RUNNING.
@@ -607,7 +616,15 @@ async fn run(cli: Cli) -> Result<i32> {
         )
         .with_mcp(cli.mcp_token.clone(), cli.mcp_max_running)
         .with_ui_dir(cli.ui_dir.clone())
-        .with_basic_auth(cli.basic_auth.clone());
+        .with_password(cli.password.clone())
+        .with_data_dir(
+            cli.data_dir
+                .as_deref()
+                .map(|d| crate::config::unquote(d).to_string())
+                .filter(|d| !d.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(stats::default_data_dir),
+        );
         api::serve(cli.api_port, state).await?;
         return Ok(0);
     }

@@ -38,8 +38,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
+# /cache holds search results; /data holds the run log behind the statistics
+# page (runs.jsonl). Mount a volume at /data (Railway: a volume on /data) or
+# the statistics start over on every deploy.
 RUN useradd --system --uid 1001 --create-home webscout \
-    && mkdir -p /cache && chown webscout /cache
+    && mkdir -p /cache /data && chown webscout /cache /data
 
 # Obscura: the headless browser webscout drives for search and page reads.
 # Both binaries ship in one archive and must sit side by side. x86_64 only.
@@ -54,6 +57,7 @@ COPY --from=builder /build/target/release/webscout /usr/local/bin/webscout
 COPY --from=ui /app/dist /usr/share/webscout/ui
 
 ENV WEBSCOUT_UI_DIR=/usr/share/webscout/ui \
+    WEBSCOUT_DATA_DIR=/data \
     XDG_CACHE_HOME=/cache \
     PORT=8080
 

@@ -126,7 +126,12 @@ impl McpState {
         jobs.iter().find(|j| j.id == id).cloned()
     }
 
-    fn running(&self) -> usize {
+    /// The token, for showing to a logged-in UI user (`GET /api/mcp`).
+    pub(crate) fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
+    pub(crate) fn running(&self) -> usize {
         self.jobs
             .lock()
             .map(|jobs| jobs.iter().filter(|j| j.is_running()).count())
@@ -198,6 +203,8 @@ struct Job {
     state: Mutex<JobState>,
     done: tokio::sync::watch::Sender<bool>,
     abort: Mutex<Option<tokio::task::AbortHandle>>,
+    /// The run-log entry as known at the start, completed when it settles.
+    record: crate::stats::RunRecord,
 }
 
 impl Job {
@@ -232,16 +239,20 @@ impl Job {
     }
 
     /// Settle a run. Only the first settlement counts: a cancel that raced a
-    /// finishing run keeps whichever landed first.
-    fn settle(&self, f: impl FnOnce(&mut JobState)) {
+    /// finishing run keeps whichever landed first. `true` when this call was
+    /// that first one — the caller then logs the run, so it is logged once.
+    fn settle(&self, f: impl FnOnce(&mut JobState)) -> bool {
+        let mut settled = false;
         if let Ok(mut s) = self.state.lock() {
             if s.status != Status::Running {
-                return;
+                return false;
             }
             f(&mut s);
             s.elapsed_ms = Some(self.started.elapsed().as_millis() as u64);
+            settled = true;
         }
         let _ = self.done.send(true);
+        settled
     }
 
     fn usage(&self) -> UsageSnapshot {
@@ -374,9 +385,14 @@ pub async fn no_stream(State(app): State<Arc<AppState>>, headers: HeaderMap) -> 
         .into_response()
 }
 
-/// `GET /api/mcp`: what the UI needs to explain how to connect. No secrets.
-pub async fn info(State(app): State<Arc<AppState>>) -> Response {
-    Json(json!({
+/// `GET /api/mcp`: what the UI needs to explain how to connect.
+///
+/// The token is included only for a logged-in user of a password-protected
+/// server: that person could already run any search the token allows, so
+/// showing it gives nothing away, while a server with no password would be
+/// handing it to anyone who can reach the page.
+pub async fn info(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let mut v = json!({
         "enabled": app.mcp.enabled(),
         "path": "/mcp",
         "transport": "streamable-http",
@@ -386,8 +402,14 @@ pub async fn info(State(app): State<Arc<AppState>>) -> Response {
             .into_iter()
             .map(|t| json!({"name": t["name"], "title": t["title"]}))
             .collect::<Vec<_>>(),
-    }))
-    .into_response()
+    });
+    if app.auth.required()
+        && app.auth.authenticated(&headers)
+        && let Some(token) = app.mcp.token()
+    {
+        v["token"] = json!(token);
+    }
+    Json(v).into_response()
 }
 
 fn rpc_result(id: Value, result: Value) -> Value {
@@ -688,7 +710,7 @@ async fn call_tool(app: &Arc<AppState>, params: &Value) -> Result<Value, (i64, S
         "start_search" => start_search(app, &args),
         "get_search_result" => get_search_result(app, &args).await,
         "get_search_status" => with_job(app, &args, |job| tool_json(status_json(job))),
-        "cancel_search" => with_job(app, &args, cancel),
+        "cancel_search" => with_job(app, &args, |job| cancel(app, job)),
         "list_searches" => list_searches(app),
         "list_search_options" => list_search_options(),
         other => return Err((-32602, format!("unknown tool: {other}"))),
@@ -808,6 +830,7 @@ fn launch(app: &Arc<AppState>, args: &Map<String, Value>) -> Result<Arc<Job>, Va
     };
 
     let id = new_run_id();
+    let record = crate::stats::RunRecord::begin(&id, query, "mcp", opts.preset.as_str());
     let (done, _) = tokio::sync::watch::channel(false);
     let job = Arc::new(Job {
         id: id.clone(),
@@ -828,6 +851,7 @@ fn launch(app: &Arc<AppState>, args: &Map<String, Value>) -> Result<Arc<Job>, Va
         }),
         done,
         abort: Mutex::new(None),
+        record,
     });
     app.mcp.insert(job.clone());
     tracing::info!(run_id = %id, query = %query, "mcp search starting");
@@ -855,20 +879,27 @@ fn launch(app: &Arc<AppState>, args: &Map<String, Value>) -> Result<Arc<Job>, Va
                     // Downloadable from the UI's endpoint too, like a UI run.
                     app.store_run(job.id.clone(), formats.clone());
                     tracing::info!(run_id = %job.id, outcome = report.outcome.as_str(), "mcp search finished");
-                    job.settle(|s| {
+                    let rec = job.record.clone().finished(&report);
+                    if job.settle(|s| {
                         s.status = Status::Finished;
                         s.report = Some(Arc::new(report));
                         s.formats = formats;
-                    });
+                    }) {
+                        app.stats.append(rec);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(run_id = %job.id, error = %e, "mcp search failed");
                     let usage = UsageSnapshot::sample(&scout);
-                    job.settle(|s| {
+                    let ms = job.started.elapsed().as_millis() as u64;
+                    let rec = job.record.clone().failed(&e.to_string(), ms, &usage);
+                    if job.settle(|s| {
                         s.status = Status::Failed;
                         s.error = Some(e.to_string());
                         s.final_usage = Some(usage);
-                    });
+                    }) {
+                        app.stats.append(rec);
+                    }
                 }
             }
         })
@@ -880,7 +911,7 @@ fn launch(app: &Arc<AppState>, args: &Map<String, Value>) -> Result<Arc<Job>, Va
     Ok(job)
 }
 
-fn cancel(job: &Job) -> Value {
+fn cancel(app: &AppState, job: &Job) -> Value {
     if !job.is_running() {
         return tool_json(json!({
             "request_id": job.id,
@@ -894,10 +925,13 @@ fn cancel(job: &Job) -> Value {
     {
         h.abort();
     }
-    job.settle(|s| {
+    let ms = job.started.elapsed().as_millis() as u64;
+    if job.settle(|s| {
         s.status = Status::Cancelled;
         s.final_usage = Some(usage);
-    });
+    }) {
+        app.stats.append(job.record.clone().cancelled(ms, &usage));
+    }
     tracing::info!(run_id = %job.id, "mcp search cancelled");
     tool_json(json!({"request_id": job.id, "status": "cancelled"}))
 }
