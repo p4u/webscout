@@ -4,13 +4,75 @@ Search the web and return **verified** results.
 
 A generative model does the writing — inventing search queries, pulling records out
 of page text, composing prose. [TypeSafe](https://docs.typesafe.ai)'s Jev model does
-the judging and writes nothing. [Obscura](https://github.com/h4ckf0r0day/obscura) is
-compiled into the binary and does the fetching.
+the judging and writes nothing. [Obscura](https://github.com/h4ckf0r0day/obscura), a
+headless browser driven as a subprocess, does the fetching.
+
+It comes as a CLI, an HTTP API with a web UI, and an MCP server that Claude Code,
+opencode, pi and other AI assistants can use to run verified searches themselves.
 
 ```bash
 webscout "what is the current stable release of Go"
 webscout -f csv "at least 100 cooperative names with their email addresses"
 webscout -vv -f json --thorough "EU AI Act obligations for GPAI providers" > out.json
+```
+
+## Run it
+
+### The ready-made image
+
+Every push to `main` builds `ghcr.io/p4u/webscout:latest`: the API, the web UI, the
+MCP server and the obscura browser in one container (see `Dockerfile`).
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e TYPESAFE_API_KEY=... \
+  -e WEBSCOUT_LLM_API_KEY=... \
+  -e WEBSCOUT_AUTH=admin:choose-a-password \
+  -e WEBSCOUT_MCP_TOKEN=$(openssl rand -hex 24) \
+  ghcr.io/p4u/webscout:latest
+# UI: http://localhost:8080    MCP: http://localhost:8080/mcp
+```
+
+| Variable | Required | What it does |
+|---|---|---|
+| `TYPESAFE_API_KEY` | yes | Jev, the judge ([console](https://console.typesafe.ai/settings/keys)) |
+| `WEBSCOUT_LLM_API_KEY` | yes | the writer model's key (OpenRouter by default) |
+| `WEBSCOUT_LLM_ENDPOINT`, `WEBSCOUT_LLM_MODEL` | no | another OpenAI-compatible endpoint or model; the endpoint is the full `/chat/completions` URL |
+| `WEBSCOUT_PLANNER_MODEL` | no | a separate model for planning |
+| `WEBSCOUT_AUTH` | on any public host | `user:password` login for the UI and `/api` (HTTP Basic). Searches are billed to your keys: without it, anyone who finds the URL can run them |
+| `WEBSCOUT_MCP_TOKEN` | to enable MCP | bearer token every MCP client must send; unset disables `/mcp` |
+| `WEBSCOUT_MCP_MAX_RUNNING` | no | MCP searches allowed at once (default 4) |
+| `JINA_API_KEY` | no | adds Jina's hosted search and reader (metered) |
+| `PORT` | no | listening port (default 8080; platforms set it) |
+
+`/api/health` stays open for health checks.
+
+### Railway, DigitalOcean
+
+Create a service from the image `ghcr.io/p4u/webscout:latest`, set the variables above,
+and expose port 8080 over HTTP. On Railway that is *New project → Docker image*;
+on DigitalOcean App Platform, *Create app → Container image → GHCR*. Both can also
+build straight from this repository, using the root `Dockerfile`. The search cache
+lives in `/cache`; mount a volume there to keep it across restarts (optional).
+
+### Locally
+
+```bash
+cp .env.example .env && $EDITOR .env   # the two required keys
+docker compose up --build              # UI on http://localhost:3000
+```
+
+Or build the CLI with `cargo build --release` (needs `obscura` on `PATH`, see
+[Building](#building)).
+
+### From an AI assistant (MCP)
+
+Open the UI's **Connect AI tools** dialog for ready-to-paste setups, or see
+[MCP server](#mcp-server). For Claude Code:
+
+```bash
+claude mcp add --transport http webscout https://<your-host>/mcp \
+  --header "Authorization: Bearer <WEBSCOUT_MCP_TOKEN>"
 ```
 
 ## Why two models
@@ -1160,6 +1222,60 @@ Jev and LLM clients, and the timer lives inside the response stream rather than
 in a spawned task, so closing the connection drops the run and the sampling
 with it.
 
+## MCP server
+
+The `--api` process also serves webscout as an MCP server at `/mcp`: Streamable
+HTTP, JSON responses, no server-initiated stream (`GET` is 405). Through the UI's
+nginx it is `http://<host>:3000/mcp`. The UI's **Connect AI tools** dialog shows
+that URL and a ready-made setup for Claude Code, opencode, pi and others (Cursor,
+VS Code, Codex CLI, Gemini CLI, and stdio-only clients through `mcp-remote`).
+
+```bash
+claude mcp add --transport http webscout http://localhost:3000/mcp \
+  --header "Authorization: Bearer $WEBSCOUT_MCP_TOKEN"
+```
+
+**A token is always required.** One shared bearer token, `WEBSCOUT_MCP_TOKEN` in
+`.env` (or `--mcp-token`). Without one the endpoint answers every call with 503 —
+it never runs open. A wrong or missing token is a 401 with a `WWW-Authenticate:
+Bearer` challenge. The token is compared in constant time and never logged.
+`GET /api/mcp` tells the UI whether the endpoint is on; it carries no secret.
+
+**Searches are jobs.** A question takes 15 s to 2 min and a list can take half an
+hour, beyond any client's tool timeout, so a run lives in a spawned task,
+independent of the connection that started it (the opposite of the NDJSON
+endpoint, where a disconnect cancels the run). The server remembers the last 100
+searches until it restarts and runs at most `WEBSCOUT_MCP_MAX_RUNNING` (default 4)
+at once.
+
+| Tool | What it does |
+|---|---|
+| `search` | Starts a search and waits about 10 s. A quick answer comes back in the same call; otherwise it returns `status: "running"` and a `request_id`. |
+| `get_search_result` | Waits up to `wait_seconds` (default 10, max 15) and returns the result, or the progress so far. `detail: "simple"` is the result text; `"full"` adds sources, notes, quarantined pages, tokens and cost, stats and structured records; `format` returns an export verbatim. |
+| `start_search` | Like `search` but returns at once, for background runs. |
+| `get_search_status` | Stage, pages read, items found, cost so far, recent progress. |
+| `cancel_search`, `list_searches`, `list_search_options` | Stop a run, find a request id again, describe every option. |
+
+The options are the same catalogue as `/api/options`: the UI's options are
+top-level `search` / `start_search` arguments, and expert knobs go in `options`.
+Unknown names are an error, as on the HTTP API.
+
+**It explains itself.** No client needs to be taught the workflow. The
+`initialize` result carries `instructions` (Claude Code puts them in its system
+prompt), every tool description says what to call next, and every `running`
+response says "call get_search_result again". Measured 2026-09-25 with prompts
+that only said "Using webscout, …": Claude Code, opencode and pi each called
+`search`, then kept calling `get_search_result` until the result arrived,
+including an eight-minute list search. The waits are short on purpose: a client
+checking every ten seconds costs this server nothing, and a short call stays
+inside every client's tool timeout except opencode's 5 s default, which is why
+its setup snippet sets `"timeout": 90000`.
+
+**List results are capped.** The simple and full views return as many items as
+the request asked for (50 if it named no number), complete ones first; `limit: 0`
+returns all. A 342-row harvest rendered whole was 52,789 characters, past Claude
+Code's tool-output limit. Exports via `format` are never cut.
+
 ## Building
 
 ```bash
@@ -1438,6 +1554,8 @@ src/search_cache.rs  on-disk cache for search-lane responses; SHA-256 keyed, 6h 
 src/candidates.rs  regex candidate extraction and normalization for email, URL, phone
 src/scout.rs       the loop: plan, triage, screen, extract, verify, enrich, replan
 src/output.rs      five renderers; per-field provenance columns in CSV
+src/api.rs         the --api HTTP server: options catalogue, NDJSON search stream, downloads
+src/mcp.rs         the MCP server at /mcp: bearer token, background search jobs, tools
 src/main.rs        CLI, logging to stderr, wiring
 ```
 

@@ -22,6 +22,16 @@ ui/dist/
 # it up.
 env
 .env
+*-api-key.txt
+*.pem
+*.key
+
+# Unrelated projects and local tool state.
+fast-jev-compaction/
+jev-browser/
+jev-search/
+.claude/
+.remember/
 
 # Editor and IDE state.
 .idea/

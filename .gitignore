@@ -1,0 +1,19 @@
+# Secrets — never commit these.
+.env
+env
+*-api-key.txt
+*.pem
+*.key
+
+# Build output.
+target/
+ui/node_modules/
+ui/dist/
+out/
+
+# Local tool state and unrelated projects checked out alongside.
+.claude/
+.remember/
+fast-jev-compaction/
+jev-browser/
+jev-search/
