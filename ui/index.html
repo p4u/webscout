@@ -7,17 +7,25 @@
     <meta name="theme-color" content="#ffffff" />
     <meta name="description" content="Search the web and get verified, grounded results." />
     <title>webscout</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='16' fill='%234285F4'/%3E%3Ctext x='16' y='22.5' font-family='Arial' font-size='19' font-weight='700' fill='white' text-anchor='middle'%3Ew%3C/text%3E%3C/svg%3E" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%230f766e'/%3E%3Cpath d='M6.5 13.5 11 22.5 16 14.5 21 22.5 26 8.5' fill='none' stroke='white' stroke-width='3.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   </head>
   <body data-boot="checking">
+    <!-- The mark: a "w" drawn as two check strokes, the last one rising like a
+         tick — web search that checks what it returns. Defined once, used by the
+         header, the home page and the login card; the favicon above is the same
+         drawing as a data URI. -->
+    <svg class="sr-only" aria-hidden="true" focusable="false">
+      <symbol id="ws-mark" viewBox="0 0 32 32">
+        <rect width="32" height="32" rx="9" fill="currentColor" />
+        <path d="M6.5 13.5 11 22.5 16 14.5 21 22.5 26 8.5" fill="none" stroke="#fff" stroke-width="3.3" stroke-linecap="round" stroke-linejoin="round" />
+      </symbol>
+    </svg>
     <!-- Shown instead of the app when the server has a password and there is no
          session. Not a browser prompt: the page itself asks, and after logging in
          the person is put back where they were. -->
     <main class="login" id="login" hidden aria-labelledby="login-title">
       <div class="login__card">
-        <div class="login__logo wordmark wordmark--small" aria-hidden="true">
-          <span>w</span><span>e</span><span>b</span><span>s</span><span>c</span><span>o</span><span>u</span><span>t</span>
-        </div>
+        <div class="login__logo logo" aria-hidden="true"><svg class="logo__mark" aria-hidden="true"><use href="#ws-mark" /></svg><span class="logo__word">web<span class="logo__accent">scout</span></span></div>
         <h1 class="login__title" id="login-title">Sign in</h1>
         <p class="login__intro">This webscout server is private. Enter its password to continue.</p>
 
@@ -45,8 +53,8 @@
     <div id="app" class="app" data-phase="idle" data-view="search" data-layout="hero" data-tools="closed">
       <header class="masthead" id="masthead">
         <div class="masthead__inner">
-          <!-- Top-right actions. On the home page they read as Google's text links;
-               in the results header they fold into round icon buttons. -->
+          <!-- Top-right actions. On the home page they are quiet text links; in the
+               results header they fold into round icon buttons. -->
           <nav class="topbar" aria-label="Account and tools">
             <a class="topbar__link" href="#stats" id="stats-link" data-view-link="stats">Statistics</a>
             <button type="button" class="topbar__btn" id="help-open" aria-haspopup="dialog" title="Examples &amp; help">
@@ -64,7 +72,7 @@
           </nav>
 
           <a class="brand" href="./" id="brand" aria-label="webscout home">
-            <span class="wordmark" aria-hidden="true"><span>w</span><span>e</span><span>b</span><span>s</span><span>c</span><span>o</span><span>u</span><span>t</span></span>
+            <span class="logo" aria-hidden="true"><svg class="logo__mark" aria-hidden="true"><use href="#ws-mark" /></svg><span class="logo__word">web<span class="logo__accent">scout</span></span></span>
           </a>
 
           <form class="search" id="search-form" autocomplete="off" role="search">
@@ -96,10 +104,9 @@
               </button>
             </div>
 
-            <!-- Home page only: Google's pair of grey buttons under the field. -->
+            <!-- Home page only: the one action, under the field. -->
             <div class="search__buttons">
-              <button type="submit" class="gbtn" id="search-btn">webscout Search</button>
-              <button type="button" class="gbtn" id="lucky" title="Run a random example question">Surprise me</button>
+              <button type="submit" class="btn btn--primary search__submit" id="search-btn">Search</button>
             </div>
 
             <div class="controls" id="controls" aria-label="Search options">
@@ -121,7 +128,32 @@
             </details>
           </form>
 
-          <!-- Results header only: Google's "All · Images · News … Tools" row. -->
+          <!-- Tokens & cost, in the results header next to the field. The pill is
+               fed by the stream's `usage` events while a run is in flight (it
+               pulses), settles on the result's own stats, and keeps the last run's
+               numbers until the next search or a return to the home page. -->
+          <div class="meter" id="meter" hidden>
+            <button type="button" class="meter__pill" id="meter-pill" aria-haspopup="dialog" aria-expanded="false" aria-controls="meter-pop" title="Tokens and cost of this search">
+              <span class="meter__live" aria-hidden="true"></span>
+              <svg class="meter__icon" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6.5" rx="7" ry="3" fill="none" stroke="currentColor" stroke-width="1.9"/><path d="M5 6.5v5.5c0 1.66 3.13 3 7 3s7-1.34 7-3V6.5M5 12v5.5c0 1.66 3.13 3 7 3s7-1.34 7-3V12" fill="none" stroke="currentColor" stroke-width="1.9"/></svg>
+              <span class="meter__cost" id="meter-cost">$0.0000</span>
+              <span class="meter__tokens" id="meter-tokens"></span>
+            </button>
+            <div class="meter__pop" id="meter-pop" role="dialog" aria-labelledby="meter-title" hidden>
+              <div class="meter__head">
+                <span class="meter__title" id="meter-title">Tokens &amp; cost</span>
+                <span class="meter__total" id="usage-total"></span>
+                <button type="button" class="meter__close" id="meter-close" aria-label="Close">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                </button>
+              </div>
+              <div class="usage" id="usage-rows" role="table" aria-label="Spend by component"></div>
+              <div class="stats" id="stats"></div>
+              <p class="meter__note" id="meter-note"></p>
+            </div>
+          </div>
+
+          <!-- Results header only: the view tabs, and Tools for the search options. -->
           <div class="tabs-row">
             <div class="tabs" role="tablist" aria-label="Views" id="tabs">
               <button type="button" class="tabs__tab" role="tab" id="tab-search" data-view="search" aria-controls="view-search" aria-selected="true">
@@ -160,24 +192,11 @@
               <span class="activity__status" id="activity-status">Starting…</span>
               <span class="activity__timer" id="timer">0.0s</span>
               <span class="activity__spacer"></span>
-              <button type="button" class="linkbtn activity__toggle" id="usage-toggle" aria-expanded="false" aria-controls="usage">Show tokens &amp; cost</button>
               <button type="button" class="linkbtn activity__toggle" id="activity-toggle" aria-expanded="true">Hide log</button>
             </div>
             <ol class="activity__list" id="activity-list"></ol>
           </section>
 
-          <!-- Live token and cost meter, hidden until asked for. Fed by the
-               stream's `usage` events while the run is in flight and settled from
-               the result's stats at the end, so what is on screen is always what
-               the run actually spent. -->
-          <section class="usage" id="usage" hidden aria-label="Tokens and cost">
-            <div class="usage__head">
-              <span class="usage__title">Tokens &amp; cost</span>
-              <span class="usage__total" id="usage-total"></span>
-            </div>
-            <div class="usage__rows" id="usage-rows"></div>
-            <div class="stats" id="stats"></div>
-          </section>
 
           <section class="reply" id="result" hidden aria-label="Result">
             <div class="reply__head">
@@ -222,18 +241,14 @@
         <section class="view-stats" id="view-stats" role="tabpanel" aria-labelledby="tab-stats" hidden></section>
       </main>
 
-      <!-- Home page only, like Google's grey footer. -->
+      <!-- Home page only: one quiet line. -->
       <footer class="footer" id="footer">
-        <div class="footer__top">Searches the web. Returns only what it can verify.</div>
-        <div class="footer__bottom">
-          <div class="footer__links">
-            <button type="button" class="footer__link" data-open="help">Examples</button>
-            <button type="button" class="footer__link" data-open="connect">Connect AI tools</button>
-          </div>
-          <div class="footer__links">
-            <a class="footer__link" href="#stats" data-view-link="stats">Statistics</a>
-          </div>
-        </div>
+        <span class="footer__tag">Searches the web. Returns only what it can verify.</span>
+        <nav class="footer__links" aria-label="More">
+          <button type="button" class="footer__link" data-open="help">Examples</button>
+          <button type="button" class="footer__link" data-open="connect">Connect AI tools</button>
+          <a class="footer__link" href="#stats" data-view-link="stats">Statistics</a>
+        </nav>
       </footer>
 
       <dialog class="help" id="help" aria-labelledby="help-title">

@@ -24,7 +24,6 @@ const el = {
   clearQuery: $('clear-query'),
   submit: $('submit'),
   searchBtn: $('search-btn'),
-  lucky: $('lucky'),
   stop: $('stop'),
   toolsToggle: $('tools-toggle'),
   toolsDot: $('tools-dot'),
@@ -44,10 +43,15 @@ const el = {
   activityStatus: $('activity-status'),
   activityList: $('activity-list'),
   activityToggle: $('activity-toggle'),
-  usageToggle: $('usage-toggle'),
   timer: $('timer'),
 
-  usage: $('usage'),
+  meter: $('meter'),
+  meterPill: $('meter-pill'),
+  meterCost: $('meter-cost'),
+  meterTokens: $('meter-tokens'),
+  meterPop: $('meter-pop'),
+  meterClose: $('meter-close'),
+  meterNote: $('meter-note'),
   usageRows: $('usage-rows'),
   usageTotal: $('usage-total'),
 
@@ -128,8 +132,6 @@ const state = {
   lastQuery: '',
   lastStats: null,
   lastUsage: null,
-  // Tokens and cost are for the curious; remembered across visits once shown.
-  showUsage: readPref('webscout.showUsage'),
   // Which client's setup the "Connect AI tools" dialog shows.
   connectClient: 'claude',
   // The server's MCP token, when a password-protected server hands it to a
@@ -166,7 +168,6 @@ async function init() {
   wireTabs();
   renderHelp();
   renderConnect();
-  applyUsageVisibility();
 
   // A private server shows the login card before anything else. An older
   // server without /api/session reads as open (see fetchSession).
@@ -220,17 +221,6 @@ function wireStaticHandlers() {
   };
   applyPlaceholder();
   narrow.addEventListener('change', applyPlaceholder);
-
-  // "Surprise me": Google's "I'm Feeling Lucky" — a random known-good example,
-  // run straight away.
-  el.lucky.addEventListener('click', () => {
-    if (state.running) return;
-    const all = EXAMPLE_GROUPS.flatMap((g) => g.examples);
-    const pick = all[Math.floor(Math.random() * all.length)];
-    el.query.value = pick;
-    el.clearQuery.hidden = false;
-    void run(pick);
-  });
 
   // "Tools" in the results header shows or hides the search options row.
   el.toolsToggle.addEventListener('click', () => {
@@ -294,11 +284,16 @@ function wireStaticHandlers() {
     setActivityLogOpen(el.activityList.hidden);
   });
 
-  el.usageToggle.addEventListener('click', () => {
-    state.showUsage = !state.showUsage;
-    writePref('webscout.showUsage', state.showUsage);
-    applyUsageVisibility();
+  // The cost pill opens its breakdown; a click elsewhere or Escape closes it.
+  el.meterPill.addEventListener('click', (event) => {
+    event.stopPropagation();
+    setMeterOpen(el.meterPop.hidden);
   });
+  el.meterClose.addEventListener('click', () => {
+    setMeterOpen(false);
+    el.meterPill.focus();
+  });
+  el.meterPop.addEventListener('click', (event) => event.stopPropagation());
 
   el.sourcesToggle.addEventListener('click', () => {
     setSourcesOpen(el.sources.hidden);
@@ -357,9 +352,17 @@ function wireStaticHandlers() {
     toggleDownloadMenu(el.downloadList.hidden);
   });
 
-  document.addEventListener('click', () => toggleDownloadMenu(false));
+  document.addEventListener('click', () => {
+    toggleDownloadMenu(false);
+    setMeterOpen(false);
+  });
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') toggleDownloadMenu(false);
+    if (event.key !== 'Escape') return;
+    toggleDownloadMenu(false);
+    if (!el.meterPop.hidden) {
+      setMeterOpen(false);
+      el.meterPill.focus();
+    }
   });
 
   // An unhandled rejection anywhere still ends up as a readable message.
@@ -413,10 +416,10 @@ async function run(rawQuery) {
   el.activityList.replaceChildren();
   setActivityLogOpen(true);
   setStatus('Contacting webscout…');
-  // The meter starts at zero from the first instant, so when someone opens it
-  // mid-run it is a thing that fills rather than a thing that appears.
+  // The meter starts at zero from the first instant and fills as the run spends.
   renderUsage(null);
   el.stats.replaceChildren();
+  showMeter(true);
 
   const controller = new AbortController();
   state.controller = controller;
@@ -504,6 +507,7 @@ function finishRun() {
   setRunning(false);
   state.controller = null;
   el.activity.dataset.live = 'false';
+  el.meter.dataset.live = 'false';
   setPhase('done');
 }
 
@@ -519,6 +523,7 @@ function handleProgress(event) {
       pages_fetched: event.counts.pages ?? state.lastStats?.pages_fetched,
       records: event.counts.records ?? state.lastStats?.records,
     };
+    renderStats(state.lastStats);
   }
 }
 
@@ -628,7 +633,7 @@ function showResult(event) {
   el.summary.textContent = sentence(event.summary);
 
   renderStats(state.lastStats);
-  // Settle the meter on the run's own accounting, so the panel and the result
+  // Settle the meter on the run's own accounting, so the pill and the result
   // can never disagree about what was spent.
   renderUsage(usageFromStats(event.stats));
   renderNotes(collectNotes(event));
@@ -785,8 +790,9 @@ function initialOf(host) {
   return (name.match(/[a-z0-9]/i)?.[0] ?? '?').toUpperCase();
 }
 
-/** A stable colour per site, so the circles tell sites apart. */
-const FAVICON_COLOURS = ['#4285f4', '#ea4335', '#f9ab00', '#34a853', '#a142f4', '#24c1e0', '#e8710a', '#1a73e8'];
+/** A stable colour per site, so the circles tell sites apart. Muted, and all
+ *  dark enough for a white letter. */
+const FAVICON_COLOURS = ['#0f766e', '#9a5b13', '#6d4fc2', '#b4435a', '#3867b5', '#55792a', '#7a6a12', '#1f7896'];
 function colourOf(host) {
   let h = 0;
   for (const ch of host) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
@@ -804,7 +810,7 @@ function renderSources(sources, quarantined) {
     const host = hostOf(source.url);
     const href = safeHref(source.url);
 
-    // Google's result header: favicon, site name, breadcrumb URL.
+    // The result's header: a site circle, the site name, a breadcrumb URL.
     const site = document.createElement('div');
     site.className = 'source__site';
     const fav = document.createElement('span');
@@ -906,8 +912,6 @@ function renderStats(stats) {
     ['Pages', pick(stats, ['pages_fetched', 'pages_read', 'pages'])],
     // An answer has no records; "0 records" would read as a failure.
     ['Records', pick(stats, ['records', 'records_found', 'record_count']) || null],
-    ['Jev', pick(stats, ['jev_requests', 'typesafe_requests'])],
-    ['LLM', pick(stats, ['llm_requests'])],
     ['Rounds', pick(stats, ['rounds'])],
   ];
 
@@ -919,7 +923,8 @@ function renderStats(stats) {
     v.className = 'stat__value';
     v.textContent = typeof value === 'number' ? formatNumber(value) : String(value);
     const l = document.createElement('span');
-    l.textContent = label.toLowerCase();
+    // "1 round", "7 pages".
+    l.textContent = Number(value) === 1 ? label.toLowerCase().replace(/s$/, '') : label.toLowerCase();
     stat.append(v, l);
     el.stats.appendChild(stat);
   }
@@ -942,7 +947,9 @@ function formatNumber(n) {
 /** Thousands separators, and never `NaN` on the screen. */
 function count(n) {
   const v = Number(n);
-  return Number.isFinite(v) ? Math.round(v).toLocaleString() : '0';
+  // 'always': some locales leave four-digit numbers ungrouped (5200 beside
+  // 27.400), which makes a column of them hard to compare.
+  return Number.isFinite(v) ? Math.round(v).toLocaleString(undefined, { useGrouping: 'always' }) : '0';
 }
 
 /** Four decimals, because a whole run often costs less than a cent. */
@@ -951,38 +958,52 @@ function usd(n) {
   return Number.isFinite(v) ? `$${v.toFixed(4)}` : null;
 }
 
+/** 1234 → "1.2k", 1234567 → "1.2M": the pill has room for a glance, not a count. */
+function compact(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return '0';
+  if (v < 1000) return String(Math.round(v));
+  if (v < 1e6) return `${(v / 1e3).toFixed(v < 1e4 ? 1 : 0)}k`;
+  return `${(v / 1e6).toFixed(v < 1e7 ? 1 : 0)}M`;
+}
+
 /**
  * The three rows of the meter, in the order they spend.
  *
  * A cost of `undefined` means the endpoint never reported one — only OpenRouter
  * does — and that row simply shows no money rather than a zero that would read
  * as "this was free". Jev's cost is always known: it is tokens times a measured
- * constant.
+ * constant. Jev reads and never writes, so it has no output or reasoning tokens
+ * (`null`, shown as a dash).
  */
 function usageRows(event) {
   const jev = event?.jev ?? {};
   const llm = event?.llm ?? {};
   const planner = event?.planner ?? {};
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
   return [
     {
       name: 'Jev',
-      requests: jev.requests ?? 0,
-      tokens: `${count(jev.input_tokens)} in`,
-      reasoning: 0,
+      requests: num(jev.requests),
+      input: num(jev.input_tokens),
+      output: null,
+      reasoning: null,
       cost: jev.cost_usd,
     },
     {
       name: 'Writer',
-      requests: llm.requests ?? 0,
-      tokens: `${count(llm.prompt_tokens)} in · ${count(llm.completion_tokens)} out`,
-      reasoning: llm.reasoning_tokens ?? 0,
+      requests: num(llm.requests),
+      input: num(llm.prompt_tokens),
+      output: num(llm.completion_tokens),
+      reasoning: num(llm.reasoning_tokens),
       cost: llm.cost_usd,
     },
     {
       name: 'Planner',
-      requests: planner.requests ?? 0,
-      tokens: `${count(planner.prompt_tokens)} in · ${count(planner.completion_tokens)} out`,
-      reasoning: planner.reasoning_tokens ?? 0,
+      requests: num(planner.requests),
+      input: num(planner.prompt_tokens),
+      output: num(planner.completion_tokens),
+      reasoning: num(planner.reasoning_tokens),
       cost: planner.cost_usd,
       // The planner shares the writer's model unless one was named, in which
       // case it never reports separately and an empty row is just noise.
@@ -1005,38 +1026,103 @@ function usageTotal(rows) {
   return sum;
 }
 
+const USAGE_COLUMNS = [
+  ['name', ''],
+  ['requests', 'Requests'],
+  ['input', 'In'],
+  ['output', 'Out'],
+  ['reasoning', 'Reasoning'],
+  ['cost', 'Cost'],
+];
+
+function usageCell(tag, text, className, title) {
+  const cell = document.createElement('span');
+  cell.className = `usage__cell usage__cell--${className}`;
+  cell.setAttribute('role', tag);
+  cell.textContent = text;
+  if (title) cell.title = title;
+  return cell;
+}
+
+function usageLine(cells, extra = '') {
+  const line = document.createElement('div');
+  line.className = `usage__row${extra ? ` ${extra}` : ''}`;
+  line.setAttribute('role', 'row');
+  line.append(...cells);
+  return line;
+}
+
+/**
+ * Draw the breakdown table and the header pill from one `usage`-shaped object.
+ * `null` is a run that has not spent anything yet.
+ */
 function renderUsage(event) {
   state.lastUsage = event;
-  el.usageRows.replaceChildren();
-
-  const rows = usageRows(event);
-  for (const row of rows) {
-    if (row.hideWhenIdle && row.requests === 0) continue;
-
-    const line = document.createElement('div');
-    line.className = 'usage__row';
-
-    const name = document.createElement('span');
-    name.className = 'usage__name';
-    name.textContent = row.name;
-
-    const metrics = document.createElement('span');
-    metrics.className = 'usage__metrics';
-    let text = `${count(row.requests)} req · ${row.tokens} tokens`;
-    if (row.reasoning > 0) text += ` · ${count(row.reasoning)} thinking`;
-    metrics.textContent = text;
-
-    const cost = document.createElement('span');
-    cost.className = 'usage__cost';
-    cost.textContent = usd(row.cost) ?? '—';
-    if (usd(row.cost) === null) cost.title = 'This endpoint does not report a cost.';
-
-    line.append(name, metrics, cost);
-    el.usageRows.appendChild(line);
-  }
-
+  const rows = usageRows(event).filter((row) => !(row.hideWhenIdle && row.requests === 0));
   const total = usageTotal(rows);
-  el.usageTotal.textContent = total === null ? '' : usd(total);
+  const dash = '—';
+  const noPrice = 'This endpoint does not report a cost.';
+
+  const head = usageLine(
+    USAGE_COLUMNS.map(([key, label]) => usageCell('columnheader', label, key)),
+    'usage__row--head',
+  );
+  const body = rows.map((row) =>
+    usageLine([
+      usageCell('rowheader', row.name, 'name'),
+      usageCell('cell', count(row.requests), 'requests'),
+      usageCell('cell', count(row.input), 'input'),
+      usageCell('cell', row.output === null ? dash : count(row.output), 'output'),
+      usageCell('cell', row.reasoning === null ? dash : count(row.reasoning), 'reasoning'),
+      usageCell('cell', usd(row.cost) ?? dash, 'cost', usd(row.cost) === null ? noPrice : ''),
+    ]),
+  );
+  const sum = (key) => rows.reduce((acc, row) => acc + (row[key] ?? 0), 0);
+  const foot = usageLine(
+    [
+      usageCell('rowheader', 'Total', 'name'),
+      usageCell('cell', count(sum('requests')), 'requests'),
+      usageCell('cell', count(sum('input')), 'input'),
+      usageCell('cell', count(sum('output')), 'output'),
+      usageCell('cell', count(sum('reasoning')), 'reasoning'),
+      usageCell('cell', total === null ? dash : usd(total), 'cost'),
+    ],
+    'usage__row--total',
+  );
+  el.usageRows.replaceChildren(head, ...body, foot);
+
+  // The pill: the money first, then how much text went through the models.
+  // An unknown price is a dash, never a $0 that would read as "free" — and so
+  // is a run that has not reported any usage at all yet.
+  const known = event != null;
+  const tokens = sum('input') + sum('output');
+  const cost = !known || total === null ? dash : usd(total);
+  el.usageTotal.textContent = cost;
+  el.meterCost.textContent = cost;
+  el.meterTokens.textContent = known ? `${compact(tokens)} tokens` : '';
+  el.meterPill.title = `Tokens and cost: ${cost} · ${count(tokens)} tokens · ${count(sum('requests'))} requests`;
+  el.meterPill.setAttribute(
+    'aria-label',
+    `Tokens and cost of this search: ${total === null ? 'cost unknown' : cost}, ${count(tokens)} tokens`,
+  );
+  el.meterNote.textContent = !known
+    ? 'No usage reported yet.'
+    : total === null
+      ? 'A model endpoint here does not report prices, so there is no total. Only OpenRouter reports cost.'
+      : '';
+  el.meterNote.hidden = el.meterNote.textContent === '';
+}
+
+/** Show or hide the header pill; a new run starts it live. */
+function showMeter(live) {
+  el.meter.hidden = false;
+  el.meter.dataset.live = String(live);
+}
+
+function setMeterOpen(open) {
+  if (open && el.meter.hidden) return;
+  el.meterPop.hidden = !open;
+  el.meterPill.setAttribute('aria-expanded', String(open));
 }
 
 /**
@@ -1047,7 +1133,9 @@ function renderUsage(event) {
  * line was missed.
  */
 function usageFromStats(stats) {
-  if (!stats) return state.lastUsage;
+  // A server that reports no usage in its stats leaves the meter as it was.
+  const reported = ['jev_requests', 'llm_requests', 'planner_requests'].some((k) => stats?.[k] != null);
+  if (!reported) return state.lastUsage;
   return {
     jev: {
       requests: stats.jev_requests ?? 0,
@@ -1199,6 +1287,9 @@ function resetToIdle() {
   el.stats.replaceChildren();
   el.usageTotal.textContent = '';
   state.lastUsage = null;
+  // The home page has no run, so no meter.
+  setMeterOpen(false);
+  el.meter.hidden = true;
   el.query.value = '';
   el.clearQuery.hidden = true;
   setPhase('idle');
@@ -1215,7 +1306,6 @@ function setRunning(running) {
   el.submit.disabled = running;
   el.submit.hidden = running;
   el.searchBtn.disabled = running;
-  el.lucky.disabled = running;
   el.stop.hidden = !running;
   el.query.readOnly = running;
   el.reset.disabled = running;
@@ -1269,32 +1359,6 @@ function toast(text) {
   state.toastId = window.setTimeout(() => {
     el.toast.hidden = true;
   }, 2400);
-}
-
-// ------------------------------------------------------------ usage toggle
-
-/** The meter exists from the start of a run; it is only shown on request. */
-function applyUsageVisibility() {
-  const show = state.showUsage;
-  el.usage.hidden = !show;
-  el.usageToggle.textContent = show ? 'Hide tokens & cost' : 'Show tokens & cost';
-  el.usageToggle.setAttribute('aria-expanded', String(show));
-}
-
-function readPref(key) {
-  try {
-    return localStorage.getItem(key) === '1';
-  } catch {
-    return false;
-  }
-}
-
-function writePref(key, on) {
-  try {
-    localStorage.setItem(key, on ? '1' : '0');
-  } catch {
-    /* private mode: the choice lasts for this page only */
-  }
 }
 
 // --------------------------------------------------------------------- help
@@ -1538,6 +1602,7 @@ function applyView(view) {
   el.viewStats.hidden = view !== 'stats';
   updateLayout();
   toggleDownloadMenu(false);
+  setMeterOpen(false);
 
   if (view === 'stats') {
     document.title = 'Statistics · webscout';
@@ -1577,6 +1642,7 @@ function requireLogin() {
 function showLogin() {
   for (const dialog of [el.help, el.connect]) if (dialog.open) dialog.close();
   toggleDownloadMenu(false);
+  setMeterOpen(false);
   document.body.dataset.boot = 'ready';
   el.app.hidden = true;
   el.login.hidden = false;

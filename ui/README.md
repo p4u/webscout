@@ -49,17 +49,21 @@ service.
 
 ## What it does
 
-- **It looks like Google Search.** The home page is Google's: text links and a round
-  log-out button in the top-right corner, the name as a large four-colour wordmark
-  (Google's blue, red, yellow and green; system font stack, no web font), the 584px
-  pill field, and two grey buttons under it — "webscout Search" and "Surprise me",
-  which runs a random question from `src/examples.js` the way "I'm Feeling Lucky"
-  skips the results. The search options sit under the buttons, and a grey footer
-  closes the page. Once a search runs the page becomes a results page: a sticky
-  header with the small wordmark, the field and Search / Statistics tabs underlined
-  in blue, with the options behind "Tools"; the answer in a bordered block like an
-  AI Overview; and each source drawn as a search result (site circle, name and
-  breadcrumb URL, blue title, support level).
+- **A search page with its own face.** One brand colour, a deep teal (`--accent`),
+  marks everything that is webscout's: the logo, links, focus rings, the active tab
+  and the primary button. The logo is an original mark — a "w" drawn as two check
+  strokes, the last one rising like a tick (web search that checks what it returns) —
+  in a rounded teal square, beside the name with "web" in ink and "scout" in teal
+  (system font stack, no web font). The mark is one inline SVG `<symbol>` in
+  `index.html`, used by the home page, the results header and the login card; the
+  favicon is the same drawing as a data URI. The home page centres the logo, a pill
+  search field and a single primary **Search** button (Enter searches too), with the
+  search options under it, quiet text links in the top-right corner and a one-line
+  footer. Once a search runs the page becomes a results page: a sticky header with
+  the small logo, the field, the tokens-and-cost pill and the Search / Statistics
+  tabs, with the options behind "Tools"; the answer in a bordered "Verified answer"
+  block; and each source listed with its site circle, name and breadcrumb URL, title
+  link and support level.
 
 - **Options are not hardcoded.** On load the UI fetches `GET /api/options` and renders
   every control from the returned schema: the `basic` group as chips under the search
@@ -91,16 +95,23 @@ service.
   `progress` events become a timestamped activity log, `stats` feed the counters, and
   the `result` event ends the run. Stop aborts through an `AbortController`, which
   drops the connection and so aborts the run server-side.
-- **Tokens and cost are available, not imposed.** The panel is hidden until "Show
-  tokens & cost" in the activity bar is pressed (remembered in `localStorage`). The
-  API sends a `usage` event about once a second; the panel shows requests and
-  tokens for Jev, the writer and the planner, plus a running total in USD. It appears
-  at zero the moment a run starts and settles on the finished run's own stats, so the
-  final numbers are the same ones the `result` event carries. The planner row is
-  hidden when it made no requests (it shares the writer's model unless one was
-  named), reasoning tokens are shown only when some were spent, and a component whose
-  endpoint does not report a cost shows `—` rather than `$0.0000` — only OpenRouter
-  returns a real price, and inventing one would be worse than admitting the gap.
+- **Tokens and cost sit in the header.** On the results page a pill right of the
+  search field shows the run's total cost and how many tokens went through the models
+  ("$0.0053 | 51k tokens"). It appears the moment a search starts and fills from the
+  `usage` events the API sends about once a second (a breathing dot while the run is
+  live), then settles on the finished run's own stats, so the final numbers are the
+  ones the `result` event carries. It keeps the last run's numbers until the next
+  search or a return to the home page, and is not shown on the idle home page or the
+  Statistics tab. Clicking it opens a popover (Escape, the close button or a click
+  outside closes it) with a table per component — Jev, the writer and the planner:
+  requests, tokens in and out, reasoning tokens and cost, plus a total row — and the
+  run's elapsed time, pages and rounds. The planner row is hidden when it made no
+  requests (it shares the writer's model unless one was named). Jev has no output or
+  reasoning tokens and shows a dash there. A cost that is not known shows `—`, never
+  `$0.0000`: a component whose endpoint does not report a price (only OpenRouter
+  does) makes the total unknown rather than a partial sum, and so does a run that
+  has not reported usage yet. On a phone the pill shows the icon and the amount only,
+  and the breakdown opens as a bottom sheet.
 - **Rendered markdown is treated as hostile.** Answers embed text scraped from the
   web, so `marked` output goes through DOMPurify before it reaches the DOM, scripts
   and event-handler attributes are stripped, and every link is forced to
@@ -108,7 +119,7 @@ service.
   are shown as escaped code blocks, never parsed as markup.
 - **Login.** On load the page asks `GET /api/session`. When the server has a password
   (`WEBSCOUT_PASSWORD`) and there is no session, a login card replaces the app: one
-  password field in a Google-style sign-in card (floating label, "Show password"
+  password field in a sign-in card under the logo (floating label, "Show password"
   checkbox), Enter submits `POST /api/login`, and a wrong
   password (401), throttling (429) or an unreachable server is shown inline. The
   session is an HttpOnly cookie, so the page never handles it; every request sends it
@@ -150,22 +161,26 @@ service.
 | `src/examples.js` | The help dialog's example questions and tips |
 | `src/connect.js` | The "Connect AI tools" dialog: MCP URL and per-client setup snippets |
 | `src/markdown.js` | `marked` + DOMPurify, link hardening, table wrapping |
-| `src/styles.css` | All styling except the statistics view; Google-like tokens (colours, fonts, the results column's `--lead` and `--col`) at the top |
+| `src/styles.css` | All styling except the statistics view; the design tokens (the teal accent and neutrals, fonts, the results column's `--lead` and `--col`) at the top |
 
 ## Notes
 
 - Light theme only. The palette lives in `:root` in `src/styles.css`; the accent is a
-  single custom property (`--accent`), and the statistics view reads the same tokens.
-- Responsive down to 360px, following Google's phone layout: a smaller wordmark and
-  icon buttons in the corner on the home page; on the results page the wordmark is
-  centred above a full-width field, the tabs scroll sideways, and dialogs open as
-  bottom sheets.
+  single custom property (`--accent`, with `--accent-hover`, `--accent-ink`,
+  `--accent-wash` and `--accent-line` derived by hand), and the statistics view reads
+  the same tokens: its spend and depth series are ramps of the accent, and "truncated"
+  is a slate blue so it never reads as teal beside "complete" green.
+- Responsive down to 360px: a smaller logo and icon buttons in the corner on the home
+  page; on the results page the logo, the cost pill and the icon buttons share the
+  top row above a full-width field, the tabs scroll sideways, and dialogs and the cost
+  breakdown open as bottom sheets.
 - Buttons and chips centre their contents with flex and symmetric padding (a chip's
   caret is drawn inside its select, so label, value and caret are one centred run).
   The text centres of every button, link-button, tab and chip were measured against
-  their boxes at 1280px and 390px: all within 0.5px.
+  their boxes at 1280px and 390px (the home Search button and the cost pill included):
+  all within 0.5px.
 - The run has phases (`data-phase` on `#app`: `idle`, `running`, `done`) and the page
   has a tab (`data-view`: `search`, `stats`). Together they set `data-layout`, which
-  the CSS keys on: `hero` (idle Search tab) is the Google home page; `compact` (a run,
+  the CSS keys on: `hero` (idle Search tab) is the centred home page; `compact` (a run,
   or the Statistics tab) is the results page's sticky header. `data-tools` on `#app`
   (`open`/`closed`) shows the options row under the tabs there.

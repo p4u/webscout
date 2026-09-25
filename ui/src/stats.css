@@ -2,24 +2,27 @@
    page (which already owns `.stats`). Tokens come from styles.css :root. */
 
 .sv {
+  /* Outcome colours stay semantic (green, amber, grey, red); "truncated" is a
+     slate blue so it never reads as the teal brand colour next to green. The
+     spend and depth series are ramps of the brand colour. */
   --sv-complete: var(--ok, #1e8e3e);
-  --sv-partial: #f9ab00;
-  --sv-truncated: var(--accent, #1a73e8);
-  --sv-empty: #9aa0a6;
+  --sv-partial: #e3a008;
+  --sv-truncated: #4f6fb0;
+  --sv-empty: #9aa3a8;
   --sv-failed: var(--danger, #d93025);
-  --sv-cancelled: #d2d5d9;
+  --sv-cancelled: #d3d9db;
 
-  --sv-jev: var(--accent, #1a73e8);
-  --sv-writer: #9334e6;
-  --sv-planner: #12b5cb;
-  --sv-spend: var(--accent, #1a73e8);
-  --sv-spend-cum: #7baaf7;
-  --sv-duration: #12b5cb;
-  --sv-quick: #8ab4f8;
-  --sv-standard: var(--accent, #1a73e8);
-  --sv-thorough: #174ea6;
-  --sv-ui: var(--accent, #1a73e8);
-  --sv-mcp: #9334e6;
+  --sv-jev: var(--accent, #0f766e);
+  --sv-writer: #8a4fd0;
+  --sv-planner: #d9822b;
+  --sv-spend: var(--accent, #0f766e);
+  --sv-spend-cum: #6fb3aa;
+  --sv-duration: #4f6fb0;
+  --sv-quick: #8fcfc6;
+  --sv-standard: var(--accent, #0f766e);
+  --sv-thorough: #0a4540;
+  --sv-ui: var(--accent, #0f766e);
+  --sv-mcp: #8a4fd0;
 
   width: min(100%, 1200px);
   margin: 0 auto;

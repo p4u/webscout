@@ -3852,14 +3852,11 @@ impl Scout {
         self.emit_progress(
             "mission",
             None,
-            format!(
-                "understood as a {} mission",
-                if mission.is_harvest() {
-                    "harvest"
-                } else {
-                    "answer"
-                }
-            ),
+            if mission.is_harvest() {
+                "understood as a list to collect".to_string()
+            } else {
+                "understood as a question to answer".to_string()
+            },
             0,
             0,
         );
