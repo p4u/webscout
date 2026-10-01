@@ -111,6 +111,95 @@ fn mission_topic(m: &Mission) -> &str {
 /// listed names without demonstrating the contact detail correctly returned
 /// zero records — five pages read, `records_extracted=0` on each, run
 /// `empty` in two minutes (measured 2026-09-21, credits live).
+/// A requested field that names where another field's value came from:
+/// `source`, `sources`, `source_url`, `source_link`, `reference`, or
+/// `{field}_source` / `{field}_source_url` / `{field}_source_link` where
+/// `{field}` is itself a mission field (so `open_source` stays a field of its
+/// own). Returns the field it refers to: the named prefix, or for a bare name
+/// the nearest non-provenance field listed before it ("the election year
+/// with the source"), or the entity field.
+fn provenance_target(fields: &[String], entity_field: &str, i: usize) -> Option<String> {
+    let lower = |x: &str| x.to_lowercase();
+    let suffixed = |x: &str| -> Option<String> {
+        let x = lower(x);
+        ["_source_url", "_source_link", "_source"]
+            .iter()
+            .find_map(|suf| x.strip_suffix(suf).map(str::to_string))
+            .and_then(|p| fields.iter().find(|f| lower(f) == p).cloned())
+    };
+    let bare = |x: &str| {
+        [
+            "source",
+            "sources",
+            "source_url",
+            "source_link",
+            "reference",
+        ]
+        .contains(&lower(x).as_str())
+    };
+    if let Some(t) = suffixed(&fields[i]) {
+        return Some(t);
+    }
+    if !bare(&fields[i]) {
+        return None;
+    }
+    let prev = fields[..i]
+        .iter()
+        .rev()
+        .find(|x| !bare(x) && suffixed(x).is_none());
+    Some(prev.cloned().unwrap_or_else(|| entity_field.to_string()))
+}
+
+/// Take the provenance fields out of a harvest mission: `(field, target,
+/// position)` for each. Never the entity field.
+fn split_provenance_fields(m: &mut Mission) -> Vec<(String, String, usize)> {
+    let mut out = Vec::new();
+    for i in 0..m.fields.len() {
+        if m.fields[i] == m.entity_field {
+            continue;
+        }
+        if let Some(t) = provenance_target(&m.fields, &m.entity_field, i) {
+            out.push((m.fields[i].clone(), t, i));
+        }
+    }
+    if !out.is_empty() {
+        let names: Vec<&String> = out.iter().map(|(f, _, _)| f).collect();
+        m.fields.retain(|f| !names.contains(&f));
+        tracing::info!(fields = ?out, "provenance fields filled from where their target was read");
+    }
+    out
+}
+
+/// Put the provenance fields back into the report's mission (same positions)
+/// and fill each record's from the recorded source of its target field: the
+/// field's own provenance when it was enriched, the record's source page when
+/// it came with the record, empty when the target is empty.
+fn restore_provenance_fields(report: &mut ScoutReport, prov: &[(String, String, usize)]) {
+    if prov.is_empty() {
+        return;
+    }
+    for (field, _, pos) in prov {
+        let at = (*pos).min(report.mission.fields.len());
+        report.mission.fields.insert(at, field.clone());
+    }
+    let entity = report.mission.entity_field.clone();
+    for rec in &mut report.records {
+        for (field, target, _) in prov {
+            let has_target = rec.fields.get(target).is_some_and(|v| !v.trim().is_empty());
+            let url = if !has_target {
+                String::new()
+            } else if let Some(fs) = rec.provenance.get(target) {
+                fs.source_url.clone()
+            } else if *target == entity || rec.fields.contains_key(target) {
+                rec.source_url.clone()
+            } else {
+                String::new()
+            };
+            rec.fields.insert(field.clone(), url);
+        }
+    }
+}
+
 /// Entity keys in the order enrichment should visit them: fewest missing
 /// mission fields first, grounding descending as the tiebreak. An
 /// enrichment slot spent on a record one field short of complete buys more
@@ -520,6 +609,20 @@ fn listable_constraints(m: &Mission) -> Vec<&str> {
 /// ministry's own resolution pages 0.08–0.13, and a generic companies
 /// directory supplied 146 records of which 1 was complete.
 fn constraint_names_the_set(m: &Mission, constraint: &str) -> bool {
+    // Jev's verdict, when one was asked, decides; the token rule only
+    // nominates (see `Mission::set_defining`).
+    if let Some(i) = m.constraints.iter().position(|c| c == constraint)
+        && let Some(Some(judged)) = m.set_defining.get(i)
+    {
+        return *judged && constraint_carries_anchor(m, constraint);
+    }
+    constraint_carries_anchor(m, constraint)
+}
+
+/// The token rule behind `constraint_names_the_set`: the constraint carries
+/// one of the mission's anchor tokens (four letters or more, not a bare
+/// number, not a common word).
+fn constraint_carries_anchor(m: &Mission, constraint: &str) -> bool {
     const COMMON: &[&str] = &[
         "with", "from", "that", "into", "over", "than", "when", "while",
     ];
@@ -689,6 +792,16 @@ const RENDER_JUDGE_CHARS: usize = 1_500;
 /// now read in full over plain HTTP (0.95 support on the first chunk).
 const RENDER_HELP_FLOOR: f64 = 0.7;
 
+/// Most questions one discovery-grounding request carries (see
+/// `ground_records`): about 14 records of 7 questions each.
+const GROUNDING_MAX_QUESTIONS: usize = 100;
+
+/// G5 recall guard (`harvest_page`): the least `has_items` for a chunk of an
+/// empty pack to be re-extracted on its own, and the most re-extractions one
+/// page may cost.
+const RECALL_HAS_ITEMS: f64 = 0.3;
+const RECALL_MAX_JOBS: usize = 6;
+
 /// Longest value extraction may write for one field (see `extract_records`).
 const EXTRACT_VALUE_MAX: usize = 300;
 
@@ -796,6 +909,31 @@ fn listability_questions(m: &Mission) -> (Value, serde_json::Map<String, Value>,
                 ),
                 "Listings of these entities typically state this property for each item they list.",
                 "Listings do not state this per item; it must be read from each entity's own page.",
+            ),
+        ));
+    }
+    // A constraint the anchor token rule would treat as naming the set gets
+    // the judge's reading too: is it a published set with its own list?
+    for (i, c) in m.constraints.iter().enumerate() {
+        if !constraint_carries_anchor(m, c) {
+            continue;
+        }
+        pairs.push((
+            format!("s{i}"),
+            noul(
+                &format!(
+                    "Does the criterion `{}` name ONE specific published set — a particular \
+                     grant call, award, prize, certification, programme edition or official \
+                     register — whose own published list enumerates exactly the entities that \
+                     meet it?",
+                    c.replace('`', "'")
+                ),
+                "Yes: the criterion is membership of one named set, and that set's own list \
+                 (the award resolution, the call's beneficiary list, the register) is exactly \
+                 the list of qualifying entities.",
+                "No: it names a kind of body, activity or event that many unrelated entities \
+                 have each on their own (a governing board, elections, a product feature), so \
+                 no single list enumerates the entities that meet it.",
             ),
         ));
     }
@@ -979,7 +1117,18 @@ fn trim_temporal_tail(topic: &str) -> &str {
 }
 
 fn listing_core_candidates(topic: &str) -> Vec<String> {
-    const MARKERS: [&str; 6] = [" that ", " which ", " who ", ", ", " and ", " with "];
+    const MARKERS: [&str; 10] = [
+        " that ",
+        " which ",
+        " who ",
+        ", ",
+        " and ",
+        " with ",
+        " whose ",
+        " where ",
+        " due ",
+        " scheduled ",
+    ];
     let mut cuts: Vec<usize> = Vec::new();
     for marker in MARKERS {
         let mut from = 0;
@@ -987,6 +1136,23 @@ fn listing_core_candidates(topic: &str) -> Vec<String> {
             cuts.push(from + i);
             from += i + marker.len();
         }
+    }
+    // A participle opens a condition as surely as "that" does: "professional
+    // colleges in Aragón holding Junta de Gobierno elections in 2026 or
+    // 2027" offered no cut at all, the judge could only keep the full topic,
+    // and every discovery goal demanded the election year — triage scored
+    // the Aragón government's register of colegios 0.10-0.18 and the run
+    // found 2 of 10 (measured 2026-09-30, Q3). The judge still chooses; a
+    // cut here is only an option ("organizations using Decidim" keeps its
+    // qualifying activity by the choice's own instructions).
+    let mut offset = 0usize;
+    for word in topic.split(' ') {
+        let letters = word.trim_matches(|c: char| !c.is_alphabetic());
+        if offset > 0 && letters.len() >= 5 && letters.to_lowercase().ends_with("ing") {
+            // `offset` is the word's start; the cut sits on the space before it.
+            cuts.push(offset - 1);
+        }
+        offset += word.len() + 1;
     }
     cuts.sort_unstable();
     cuts.dedup();
@@ -1021,6 +1187,96 @@ fn listing_core_candidates(topic: &str) -> Vec<String> {
 /// harvest-start choice picked one, the topic otherwise. Query building and
 /// steer do NOT go through this — they keep the full topic so searches stay
 /// specific while the accept-side goal names a list that can exist.
+/// Does `text` carry a constraint's content — at least half of its content
+/// words (four letters or more, or a number, stopwords aside)?
+fn carries_constraint(text: &str, constraint: &str) -> bool {
+    const STOP: &[&str] = &[
+        "will", "with", "that", "have", "been", "from", "into", "than", "their", "this", "they",
+        "which", "were", "each", "every",
+    ];
+    let ctoks: Vec<String> = word_tokens(constraint)
+        .into_iter()
+        .filter(|t| t.chars().count() >= 4 || t.chars().all(|c| c.is_ascii_digit()))
+        .filter(|t| !STOP.contains(&t.as_str()))
+        .collect();
+    if ctoks.is_empty() {
+        return false;
+    }
+    let ttoks: HashSet<String> = word_tokens(text).into_iter().collect();
+    let hit = ctoks.iter().filter(|t| ttoks.contains(*t)).count();
+    hit * 2 >= ctoks.len()
+}
+
+/// The listing core, re-chosen when the judge's pick still carries a
+/// constraint the same request judged unlistable.
+///
+/// The two asks ride one request and cannot see each other's answer: Q3's
+/// listability noul read "will hold Junta de Gobierno elections in 2026 or
+/// 2027" unlistable, while the core choice kept the full topic, which
+/// carries that very condition — so the constraint left the goals' criteria
+/// and stayed in their subject (measured 2026-09-30). Code reconciles the two
+/// verdicts: the longest candidate that carries no unlistable constraint,
+/// but never the bare entity type, which names every register of such
+/// things (q62's measured failure). `None` leaves the pick alone.
+fn core_without_unlistable(m: &Mission, candidates: &[String]) -> Option<String> {
+    let unlistable: Vec<&String> = m
+        .constraints
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| m.unlistable_constraints.get(*i).copied().unwrap_or(false))
+        .map(|(_, c)| c)
+        .filter(|c| !constraint_names_the_set(m, c))
+        .collect();
+    if unlistable.is_empty() {
+        return None;
+    }
+    let carries_any = |t: &str| unlistable.iter().any(|c| carries_constraint(t, c));
+    if !carries_any(goal_topic(m)) {
+        return None;
+    }
+    let type_tokens = word_tokens(&m.entity_type);
+    candidates
+        .iter()
+        .filter(|c| !carries_any(c))
+        .filter(|c| {
+            let toks = word_tokens(c);
+            toks.len() > type_tokens.len().max(1) && toks != type_tokens
+        })
+        .max_by_key(|c| c.chars().count())
+        .cloned()
+}
+
+/// For the query writers of a harvest: which constraints are checked per
+/// entity after discovery rather than searched for, in one sentence, or
+/// empty when there are none.
+///
+/// The planner and the re-aim were given the raw request and every
+/// constraint, and argued the run away from the population: Q3's re-aim
+/// read "searches targeted a generic directory/registry of all professional
+/// colleges in Aragón rather than pages announcing specific Junta de
+/// Gobierno election schedules" and wrote election-announcement searches,
+/// while the register it had just found was the one page that named the
+/// population (measured 2026-09-30).
+fn per_entity_note(m: &Mission) -> String {
+    let listable = listable_constraints(m);
+    let per_entity: Vec<&str> = m
+        .constraints
+        .iter()
+        .map(String::as_str)
+        .filter(|c| !listable.contains(c))
+        .collect();
+    if per_entity.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Checked per entity AFTER discovery, not searched for: {}. No listing states \
+         this; the run reads each listed entity's own pages for it. So search for pages \
+         that LIST the population ({}), not for pages about the per-entity condition.",
+        per_entity.join("; "),
+        goal_topic(m)
+    )
+}
+
 fn goal_topic(m: &Mission) -> &str {
     if m.listing_core.trim().is_empty() {
         mission_topic(m)
@@ -2376,9 +2632,16 @@ const ANSWER_FOLLOW_CAP: usize = 2;
 /// read per level, and links offered to Jev per level. Two levels because the
 /// page that answers is usually one section down: Som Energia's board page is
 /// homepage -> "sobre nosotros" -> "consejo rector" (measured 2026-09-25).
+/// 160 links, not 40: in page order the first 40 of anfac.com's 142 are the
+/// top menu, and "Contacto de prensa" — where the communications director's
+/// email is — was never offered (measured 2026-09-30). A link costs about 30
+/// tokens to judge.
 const SITE_WALK_DEPTH: usize = 2;
+/// Official-site walks per answer run: the first while anything is open, a
+/// second only for parts the first was not aimed at.
+const MAX_SITE_WALKS: usize = 2;
 const SITE_WALK_PER_LEVEL: usize = 3;
-const SITE_LINK_CANDIDATE_CAP: usize = 40;
+const SITE_LINK_CANDIDATE_CAP: usize = 160;
 
 /// Least probability for Jev's pick of the subject's official website.
 const OFFICIAL_SITE_FLOOR: f64 = 0.6;
@@ -2987,14 +3250,96 @@ fn answer_part_question(field: &str) -> Value {
              page: the items are about it, or cite it, without giving where it is.",
         )
     } else {
+        // The resolved-negative clause is narrow on purpose. Worded "or the
+        // evidence authoritatively shows it does not exist", a leadership
+        // page naming ANFAC's communications director without an email was
+        // read as settling "the email of its communications director", and
+        // the part was never searched for (measured 2026-09-30). Absence
+        // only counts on the page whose job is to publish that very thing.
         noul(
             &format!("Does `evidence` supply the {words} that `question` asks for?"),
-            "A reader could state that part of the answer from the evidence alone, or the \
-             evidence authoritatively shows it does not exist.",
-            "The evidence leaves that part unresolved.",
+            "A reader could state that part of the answer from the evidence alone. Absence \
+             counts only when an item IS the page that publishes exactly this kind of \
+             information for the subject (its contact page for its contact addresses) and \
+             it is not there.",
+            "The evidence leaves that part unresolved: it does not state it, or only shows \
+             pages about related things (a leadership page without contact details does \
+             not settle an email).",
         )
     }
 }
+
+/// Per-chunk screening question for one part of a multi-part question.
+///
+/// Literal on purpose. Worded "does it state the X, or a fact it is worked
+/// out from?", ICAB's Junta de Govern page — no email, no phone on it —
+/// scored 0.93-0.96 on every part of a six-part profile question, email and
+/// phone included, and the per-part reservation reserved nothing (measured
+/// 2026-09-30). The inputs of a derived part (a mandate's length and start)
+/// still reach the writer: they answer the question itself, so they rank on
+/// `supports`.
+fn screen_part_question(slot: usize, words: &str) -> Value {
+    noul(
+        &format!("Is the {words} that `question` asks for written in `passages[{slot}]` itself?"),
+        "The passage itself contains that value — the actual email address, phone number, \
+         count, name or date asked for — not just a mention of the subject.",
+        "The value is not in this passage: it is about the subject but gives other \
+         information, or only refers to where the value might be found.",
+    )
+}
+
+/// One noul per answer part, asked beside `answer_part_question`: is a part
+/// the evidence does not state outright still settled by facts it does?
+///
+/// Measured 2026-09-30, ICAB "date of the next Junta de Govern election":
+/// the evidence read gave the dean's inauguration in July 2025, a four-year
+/// mandate and a "Pla de Govern 2025-2029", nothing stated the next election,
+/// and the part was reported "not found" on every run. A person reading the
+/// same pages answers "2029, estimated from the mandate". The judge decides
+/// whether the inference is sound; the writer is then told to make it and to
+/// label it (`derived_parts_writer_note`).
+fn answer_derivable_question(field: &str) -> Value {
+    let words = field_words(field);
+    noul(
+        &format!(
+            "No evidence item needs to state the {words} outright. Can it be worked out from \
+             facts `evidence` does state, by simple date or arithmetic reasoning a careful \
+             reader would accept as an estimate?"
+        ),
+        "Yes: the evidence states the facts it follows from — for example a start date and a \
+         term length give when the term ends and the next election falls due, or a founding \
+         year and today's date give an age.",
+        "No: the facts it would follow from are not in the evidence, or working it out would \
+         need guessing beyond them.",
+    )
+}
+
+/// At or above this, a part the evidence does not state is judged derivable
+/// from what it does state. The same bar as "answered".
+const DERIVABLE_FLOOR: f64 = 0.7;
+
+/// What the writer is told about parts the judge found derivable but not
+/// stated.
+fn derived_parts_writer_note(derived: &[String]) -> Option<String> {
+    if derived.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = derived.iter().map(|f| field_words(f)).collect();
+    Some(format!(
+        "The passages do not state {} outright, but it has been judged derivable from facts \
+         they do state. Work it out from those facts, give the facts it rests on with their \
+         citations, and label the result an estimate — for example \"2029 (estimated: the \
+         four-year mandate began in July 2025 [2][4])\". Never present an estimate as a stated \
+         fact.",
+        parts.join(", ")
+    ))
+}
+
+/// How many of the selected evidence passages the answer-path planner sees
+/// (see `plan_queries`), and how much of each. Ten excerpts of 700 characters
+/// keep the prompt near 8,000 characters.
+const PLANNER_KNOWN_PASSAGES: usize = 10;
+const PLANNER_EXCERPT_CHARS: usize = 700;
 
 /// Rounds an answer mission may use.
 ///
@@ -3038,6 +3383,19 @@ fn missing_parts_writer_note(open_parts: &[String]) -> Option<String> {
     ))
 }
 
+/// `assess` read back per part (see `Scout::answer_verdict`).
+#[derive(Debug, Clone, Default)]
+struct AnswerVerdict {
+    /// The least-answered part, holistic verdict included.
+    answered: f64,
+    /// Parts neither stated nor derivable.
+    missing: Vec<String>,
+    /// Parts not stated but judged derivable from what is.
+    derived: Vec<String>,
+    /// Jev's `conflict` noul: do the sources disagree?
+    conflict: f64,
+}
+
 /// An answer is only as answered as its least-answered part.
 ///
 /// The holistic verdict stays in the minimum on purpose: a mission with no
@@ -3045,12 +3403,32 @@ fn missing_parts_writer_note(open_parts: &[String]) -> Option<String> {
 /// exactly, so single-fact questions behave as they always have. A failed
 /// part ask arrives here as absent, never as 1.0 — a failed guard is never
 /// an open door, but neither may it silently erase a part.
+///
+/// When every part was judged, the parts alone decide. The holistic noul
+/// cannot credit a part that is derived rather than stated, and kept a
+/// profile question whose six parts were all answered or derived at 0.36-0.44
+/// for four rounds, so the run searched to its ceiling (measured 2026-09-30,
+/// ICAB: 149 s where the evidence was complete by round 3).
 fn answered_across_parts(answered: f64, parts: &[Option<f64>]) -> f64 {
+    if !parts.is_empty() && parts.iter().all(Option::is_some) {
+        return parts.iter().flatten().copied().fold(1.0, f64::min);
+    }
     parts
         .iter()
         .map(|p| p.unwrap_or(0.0))
         .fold(answered, f64::min)
 }
+
+/// Most passages the writer, and every check of the answer, is given.
+const EVIDENCE_CAP: usize = 14;
+
+/// Cap how much of the ranked evidence any single page may occupy.
+///
+/// Without this a long, on-topic page wins every slot: each of its chunks
+/// scores well independently, so a 14-item evidence list becomes 12 chunks
+/// of one document. That looks like corroboration and is not — the answer
+/// ends up resting on a single source while appearing to cite many.
+const MAX_PER_SOURCE: usize = 3;
 
 /// How much of each evidence passage the writer and every checker read: the
 /// whole chunk. They used to differ — the writer 3,000 characters, the claim
@@ -3298,6 +3676,57 @@ const ABBREVIATIONS: &[&str] = &[
 ///
 /// Fragments under [`MIN_CLAIM_CHARS`] and fragments with no letters are dropped:
 /// they assert nothing, and every claim kept costs one Jev question.
+/// Does the written answer say, in its own words, that part of the question
+/// went unanswered? An uncited sentence about the sources ("…was not found in
+/// the sources", "the sources do not settle…").
+///
+/// The writer sometimes sees a gap the judge did not: measured 2026-09-30
+/// (ANFAC), the email part was judged answered on a passage giving a former
+/// director's address, the writer said the current director's email was not
+/// settled, and the run reported `complete` above that sentence.
+fn answer_admits_a_gap(answer: &str) -> bool {
+    // Citation or not: "the provided sources do not contain the email [2]"
+    // cites the page it looked at and is still an admission (measured
+    // 2026-09-30, ANFAC: `complete` above exactly that sentence).
+    answer
+        .split(['\n', '.'])
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .any(|t| GAP_MARKERS.iter().any(|m| t.contains(m)))
+}
+
+/// Phrases with which the writer says a part of the question went
+/// unanswered; `is_meta_claim` and `answer_admits_a_gap` share them.
+const GAP_MARKERS: &[&str] = &[
+    "not found in the sources",
+    "not stated in the sources",
+    "sources do not",
+    "sources don't",
+    "none of the sources",
+    "no source states",
+];
+
+/// A sentence that asserts nothing about the world: a lead-in ending in a
+/// colon ("The profile of ICAB is as follows:"), or an uncited statement
+/// about the sources themselves ("This was not found in the sources."),
+/// which is what `missing_parts_writer_note` tells the writer to say. Both
+/// used to be checked as claims and came back `[unsupported]` — correctly,
+/// since no evidence item states them, and uselessly, since there is nothing
+/// in them to support (measured 2026-09-30, ICAB). A sentence with a
+/// citation marker is always checked.
+fn is_meta_claim(text: &str) -> bool {
+    let plain = text.trim_end_matches(['*', '_', ' ']);
+    if plain.ends_with(':') {
+        return true;
+    }
+    let cited = text.contains('[') && text.chars().any(|c| c.is_ascii_digit());
+    if cited {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    GAP_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 pub fn split_claims(answer: &str) -> Vec<Claim> {
     let bytes = answer.as_bytes();
     let len = bytes.len();
@@ -3362,6 +3791,9 @@ pub fn split_claims(answer: &str) -> Vec<Claim> {
             continue;
         }
         if !trimmed.chars().any(char::is_alphabetic) {
+            continue;
+        }
+        if is_meta_claim(trimmed) {
             continue;
         }
         let lead = raw.len() - raw.trim_start().len();
@@ -3492,7 +3924,8 @@ pub(crate) fn claim_question(claim: &str) -> Value {
 const CLAIM_SUPPORTED: &str = "An evidence item states this claim or directly implies it. An \
      item's `source` is evidence of its own address: a claim that an address is where some \
      thing is published is supported when the item with that `source` is that thing's own \
-     page.";
+     page. A claim that labels itself an estimate is supported when the facts it names are in \
+     the evidence and the estimate follows from them by simple date or arithmetic reasoning.";
 
 /// Serialized cost of one claim question, for batch planning.
 fn claim_question_cost(slot: usize, claim: &str) -> usize {
@@ -3589,31 +4022,166 @@ pub(crate) fn passage_rank(p: &Passage) -> f64 {
     p.supports * p.currency
 }
 
+/// Jev's reading of one screened text unit on the answer path.
+#[derive(Debug, Clone, Default)]
+struct Screened {
+    injection: f64,
+    /// Does it answer the question, in whole or in part?
+    supports: f64,
+    /// Is it current as of today? 1.0 when not asked.
+    currency: f64,
+    /// Per `answer_parts` entry: does it state that part, or a fact it is
+    /// worked out from? Empty when the question has fewer than two parts.
+    parts: Vec<f64>,
+}
+
+impl Screened {
+    /// What a failed screening call reads as: unsafe, unsupportive.
+    fn failed(parts: usize) -> Self {
+        Screened {
+            injection: 1.0,
+            supports: 0.0,
+            currency: 1.0,
+            parts: vec![0.0; parts],
+        }
+    }
+
+    fn best_part(&self) -> f64 {
+        self.parts.iter().copied().fold(0.0, f64::max)
+    }
+}
+
 /// The verdict on one screened text unit, in the order the gates apply:
-/// injection first (withheld), then currency (dropped as stale), then support
-/// (kept as evidence). Shared by the chunk-level pass and the paragraph-level
-/// resplit so the two passes can never disagree about a threshold.
+/// injection first (withheld), then support (kept as evidence). Shared by the
+/// chunk-level pass and the paragraph-level resplit so the two passes can
+/// never disagree about a threshold.
+///
+/// Currency is not a gate. It used to drop a passage below
+/// `Tunables::currency_floor`, and on questions that mix "current" with
+/// "since when" or "next" it threw away exactly the evidence those parts
+/// need: measured 2026-09-30, ANFAC's own 2020 appointment release (support
+/// 0.94, currency 0.05) and four press reports of the same appointment were
+/// dropped and "since when" came back not found; on ICAB, the 2024 annual
+/// report (the member count) and the 2025 election acts (the mandate) died at
+/// 0.88-0.91 support. A dated passage is history, not falsehood: it now ranks
+/// lower (`passage_rank`), is labelled for the writer, and `pick_most_recent`
+/// still decides what is current.
+///
+/// A passage is kept when it answers the question as a whole or any one of
+/// its parts: a footer carrying the phone number scores low against a
+/// six-part profile question and is still the only source of that part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenVerdict {
     Quarantined,
-    Stale,
     Kept,
     NotSupportive,
 }
 
-fn screen_verdict(
-    t: &Tunables,
-    (injection, supports, currency): &(f64, f64, f64),
-) -> ScreenVerdict {
-    if *injection >= t.injection_ceiling {
+fn screen_verdict(t: &Tunables, s: &Screened) -> ScreenVerdict {
+    if s.injection >= t.injection_ceiling {
         ScreenVerdict::Quarantined
-    } else if *currency < t.currency_floor {
-        ScreenVerdict::Stale
-    } else if *supports >= t.keep_support {
+    } else if s.supports >= t.keep_support || s.best_part() >= t.keep_support {
         ScreenVerdict::Kept
     } else {
         ScreenVerdict::NotSupportive
     }
+}
+
+/// How many passages each part reserves in `select_evidence` before ranking
+/// fills the remaining slots.
+const RESERVED_PER_PART: usize = 2;
+
+/// Evidence for the writer and for every check of it, chosen to cover each
+/// part of the question before ranking fills the rest.
+///
+/// Ranked by `passage_rank` alone, a six-part profile question's 14 slots went
+/// to the passages that best answer the question *as a whole*, and the only
+/// passage stating the member count could be cut (measured 2026-09-30, ICAB:
+/// members found on one run, lost on the next). So each part first reserves
+/// its best passages (by part support, current ones ahead of superseded
+/// ones), round-robin so no part takes a second slot before every part has
+/// its first; the rest fill by rank with at most `per_source` passages per
+/// page. A reserved passage ignores the per-source cap: it is there for its
+/// part, not as corroboration.
+///
+/// Used for the in-loop assessment and the final answer alike, so the judge
+/// that decides a part is answered sees exactly the evidence the writer gets.
+fn select_evidence(
+    evidence: &[Passage],
+    parts: usize,
+    cap: usize,
+    per_source: usize,
+    floor: f64,
+) -> Vec<Passage> {
+    let by_rank = |a: &usize, b: &usize| {
+        passage_rank(&evidence[*b])
+            .partial_cmp(&passage_rank(&evidence[*a]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    // Part support decides; currency only breaks near-ties. Scaled by
+    // currency, a press-contact page Jev read as 0.25-current (its chunk
+    // holding the communications director's email scored 0.86 on the part)
+    // lost its reserved slot to a directory snippet at 0.70 and then the
+    // ranked fill at 0.73 x 0.25, and the answer said the email was not in
+    // the sources (measured 2026-09-30, ANFAC).
+    let part_score = |i: usize, k: usize| -> f64 {
+        let p = &evidence[i];
+        p.part_support.get(k).copied().unwrap_or(0.0) + 0.05 * p.currency
+    };
+    let per_part: Vec<Vec<usize>> = (0..parts)
+        .map(|k| {
+            let mut v: Vec<usize> = (0..evidence.len())
+                .filter(|&i| evidence[i].part_support.get(k).copied().unwrap_or(0.0) >= floor)
+                .collect();
+            v.sort_by(|&a, &b| {
+                part_score(b, k)
+                    .partial_cmp(&part_score(a, k))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            v
+        })
+        .collect();
+
+    let mut chosen: Vec<usize> = Vec::new();
+    for depth in 0..RESERVED_PER_PART {
+        for list in &per_part {
+            if chosen.len() >= cap {
+                break;
+            }
+            // A part already holding more than `depth` chosen passages (some
+            // chosen for another part) needs no slot at this depth.
+            if list.iter().filter(|i| chosen.contains(i)).count() > depth {
+                continue;
+            }
+            if let Some(&i) = list.iter().find(|i| !chosen.contains(i)) {
+                chosen.push(i);
+            }
+        }
+    }
+
+    let mut per_url: HashMap<&str, usize> = HashMap::new();
+    for &i in &chosen {
+        *per_url.entry(evidence[i].url.as_str()).or_insert(0) += 1;
+    }
+    let mut order: Vec<usize> = (0..evidence.len()).collect();
+    order.sort_by(by_rank);
+    for i in order {
+        if chosen.len() >= cap {
+            break;
+        }
+        if chosen.contains(&i) {
+            continue;
+        }
+        let n = per_url.entry(evidence[i].url.as_str()).or_insert(0);
+        if *n >= per_source {
+            continue;
+        }
+        *n += 1;
+        chosen.push(i);
+    }
+    // Writer order: best rank first, so citation [1] is the strongest source.
+    chosen.sort_by(by_rank);
+    chosen.into_iter().map(|i| evidence[i].clone()).collect()
 }
 
 /// Split a quarantined chunk into finer sub-chunks on paragraph boundaries.
@@ -3891,6 +4459,12 @@ impl Scout {
             // and enrichment needs the referential subject (offers_api is
             // about the provider, not the municipality). One LLM call per
             // field, once per run.
+            // "…the election year with the source": the source is where the
+            // year was read, which provenance already records. As a field of
+            // its own it was classified a yes/no determination and came back
+            // "no" on every record (measured 2026-09-30, Q3). Taken out of the
+            // run here, filled from provenance at the end.
+            let provenance_fields = split_provenance_fields(&mut mission);
             let mut enrich_templates: HashMap<String, EnrichTemplates> = HashMap::new();
             for f in mission
                 .fields
@@ -3922,6 +4496,7 @@ impl Scout {
             report.mission = mission.clone();
             self.run_harvest(&mission, &mut enrich_templates, &mut report)
                 .await?;
+            restore_provenance_fields(&mut report, &provenance_fields);
         } else {
             self.run_answer(&mission, &mut report).await?;
         }
@@ -4185,6 +4760,7 @@ impl Scout {
             // Filled by `judge_listability` at harvest start, not here — the
             // parse itself never decides listability.
             unlistable_constraints: Vec::new(),
+            set_defining: Vec::new(),
             listing_core: String::new(),
             // A harvest is never a single-fact lookup, whatever the classifier says.
             simple: parsed.simple && kind == MissionKind::Answer,
@@ -4372,6 +4948,12 @@ impl Scout {
                 m.unlistable_constraints = (0..m.constraints.len())
                     .map(|i| a.noul_or(&format!("l{i}"), 1.0) < 0.5)
                     .collect();
+                m.set_defining = (0..m.constraints.len())
+                    .map(|i| {
+                        let id = format!("s{i}");
+                        a.is_sane(&id).then(|| a.noul(&id) >= 0.5)
+                    })
+                    .collect();
                 match parse_core_pick(&a.choice("core")) {
                     CorePick::Candidate(i) if core_candidates.get(i).is_some() => {
                         tracing::debug!(core = %core_candidates[i], "listing core selected");
@@ -4458,6 +5040,23 @@ impl Scout {
                 );
             }
         }
+        if let Some(core) = core_without_unlistable(m, &core_candidates) {
+            tracing::info!(
+                from = %goal_topic(m),
+                core = %core,
+                "listing core carried an unlistable constraint; using a cut without it"
+            );
+            m.listing_core = core;
+        }
+        tracing::info!(
+            topic = %m.topic,
+            listing_core = %m.listing_core,
+            constraints = ?m.constraints,
+            unlistable = ?m.unlistable_constraints,
+            set_defining = ?m.set_defining,
+            goal = %discovery_goal(m),
+            "harvest goals settled"
+        );
     }
 
     /// Re-run the mission classifier after Jev flagged the first pass as
@@ -4572,6 +5171,7 @@ impl Scout {
             constraint_glosses,
             // Same as the first parse: `judge_listability` fills this later.
             unlistable_constraints: Vec::new(),
+            set_defining: Vec::new(),
             listing_core: String::new(),
             simple: parsed.simple && kind == MissionKind::Answer,
             entity_field,
@@ -5401,7 +6001,11 @@ impl Scout {
                 }
             }
 
-            let gained = store.len() - before;
+            // Saturating: merges and category-echo drops can shrink the store
+            // in a round, and the wrapped difference read as 18 quintillion
+            // new records — to the barren rule, to steer's prompt and to
+            // `decide_bottleneck` (measured 2026-09-30, Q3: 91 -> 86 -> 81).
+            let gained = store.len().saturating_sub(before);
             tracing::info!(
                 round,
                 gained,
@@ -5948,7 +6552,7 @@ impl Scout {
             let ps = self
                 .timed(
                     "2 plan queries",
-                    self.plan_queries(mission, round, found, &tried, &productive, &[]),
+                    self.plan_queries(mission, round, found, &tried, &productive, &[], &[]),
                 )
                 .await?;
             for q in &ps {
@@ -6545,6 +7149,7 @@ impl Scout {
                 tracing::debug!(
                     chars = p.text.len(),
                     chunks = p.chunks.len(),
+                    best_has_items = p.chunks.iter().map(|(_, h)| *h).fold(0.0, f64::max),
                     records = result.as_ref().map_or(0, |r| r.len()),
                     ms = started.elapsed().as_millis() as u64,
                     "extract pack"
@@ -6567,28 +7172,27 @@ impl Scout {
             .await;
 
         // G5: recall guard. Any pack that yielded zero records but contained
-        // a chunk Jev thought clearly list-shaped (has_items >= 0.5) gets
+        // a chunk Jev thought list-shaped (has_items >= RECALL_HAS_ITEMS) gets
         // re-extracted per chunk. Measured motivation: packed extraction
         // occasionally misses tables when the passage is glued to less
         // list-shaped prose; re-reading the strong chunk alone recovers them.
+        //
+        // Single-chunk packs are retried too: an empty answer is not only a
+        // drowned table but a flaky decode. Measured 2026-09-30 (Q3): the
+        // Aragón government's register of ~80 colegios, clean one-row-per-
+        // line text, came back `records: []` in about a second from both of
+        // its packs, while the same prompt sent directly returned every row
+        // on three of three tries — the endpoint routes between providers,
+        // and one answers a long schema-constrained request with an empty
+        // list. The run read the register and never knew.
         let mut extracted: Vec<ExtractedPack> = extracted;
         let mut recovery_jobs: Vec<(usize, String)> = Vec::new();
         for (i, ep) in extracted.iter().enumerate() {
             if !ep.candidates.is_empty() {
                 continue;
             }
-            if ep.chunks.len() < 2 {
-                // A single-chunk pack cannot benefit from unpacking; only
-                // multi-chunk packs where a strong chunk was drowned by
-                // weaker neighbours warrant the retry.
-                continue;
-            }
-            let strong = ep.chunks.iter().any(|(_, h)| *h >= 0.5);
-            if !strong {
-                continue;
-            }
             for (chunk_text, h) in &ep.chunks {
-                if *h < 0.5 {
+                if *h < RECALL_HAS_ITEMS || recovery_jobs.len() >= RECALL_MAX_JOBS {
                     continue;
                 }
                 recovery_jobs.push((i, chunk_text.clone()));
@@ -6954,10 +7558,20 @@ impl Scout {
         let effective_request_budget = request_budget
             .saturating_sub(passage_cost)
             .saturating_sub(per_batch_extra);
+        // The item cap counts RECORDS, and each record carries several
+        // questions, so capping records at the per-request question limit let
+        // one request reach 217 questions (31 records x 7). Measured
+        // 2026-09-30 (Q3, the Aragón register): the same records at 210-217
+        // questions per request read `contradicts` on "is a professional
+        // college" for 6 of 62, split to 100-114 questions for 1 of 62 — and
+        // every contradiction excludes a record. Cap the questions instead.
+        let questions_per_record = per_record_nouls + mission.constraints.len();
+        let records_per_batch = (GROUNDING_MAX_QUESTIONS / questions_per_record.max(1))
+            .clamp(1, self.t().max_questions_per_request);
         let record_batches = plan_batches_dual(
             &record_state_costs,
             &record_total_costs,
-            self.t().max_questions_per_request,
+            records_per_batch,
             effective_state_budget,
             effective_request_budget,
         );
@@ -7245,6 +7859,10 @@ impl Scout {
         // Pages of the subject's own website (`walk_official_site`), kept for
         // the equivalent-term check after the loop.
         let mut official_pages: Vec<crate::browser::PageContent> = Vec::new();
+        // Parts the official-site walk has already been aimed at, and how
+        // many walks ran (at most `MAX_SITE_WALKS`).
+        let mut walked_for: HashSet<String> = HashSet::new();
+        let mut walks = 0usize;
 
         for round in 1..=answer_round_ceiling(self.t().max_rounds, self.t().auto_rounds) {
             report.stats.rounds = round;
@@ -7271,9 +7889,7 @@ impl Scout {
                 for page in pages {
                     report.stats.pages_fetched += 1;
                     seen_urls.insert(page.url.clone());
-                    let g = self
-                        .screen_page(&mission.query, mission.time_sensitive, false, page)
-                        .await;
+                    let g = self.screen_page(mission, page).await;
                     report.stats.chunks_examined += g.chunks_examined;
                     report.stats.quarantined += g.quarantined_chunks;
                     if g.quarantined_chunks > 0 {
@@ -7310,6 +7926,7 @@ impl Scout {
                         &tried,
                         &HashMap::new(),
                         &missing,
+                        &self.select_for_answer(mission, &evidence),
                     ),
                 )
                 .await?
@@ -7367,63 +7984,6 @@ impl Scout {
                 evidence.extend(g.passages);
             }
 
-            // The subject's own website, when round 1 neither answered the
-            // question nor read a page of it. See `walk_official_site`: third
-            // parties dominate search results for a named organisation, and
-            // the answer is often only on its own pages. The assessment gate
-            // keeps the walk off runs round 1 already answered.
-            if round == 1
-                && let Some(anchor) = mission
-                    .anchors
-                    .iter()
-                    .map(|a| a.trim())
-                    .find(|a| !a.is_empty())
-                && !evidence
-                    .iter()
-                    .any(|p| on_anchor_site(&p.url, &mission.anchors))
-            {
-                let answered = if evidence.len() >= 3 {
-                    self.assess(mission, &evidence)
-                        .await
-                        .map(|v| Self::answer_verdict(mission, &v).0)
-                        .unwrap_or(0.0)
-                } else {
-                    0.0
-                };
-                if answered < 0.7 {
-                    self.emit_progress(
-                        "follow",
-                        Some(round),
-                        format!("looking for {anchor}'s own website"),
-                        report.stats.pages_fetched,
-                        evidence.len(),
-                    );
-                    let site = self
-                        .timed(
-                            "5d walk official site",
-                            self.walk_official_site(mission, anchor, &seen_urls),
-                        )
-                        .await;
-                    for page in site {
-                        official_pages.push(page.clone());
-                        if !seen_urls.insert(page.url.clone()) {
-                            continue;
-                        }
-                        report.stats.pages_fetched += 1;
-                        report.stats.links_followed += 1;
-                        let g = self
-                            .screen_page(&mission.query, mission.time_sensitive, false, page)
-                            .await;
-                        report.stats.chunks_examined += g.chunks_examined;
-                        report.stats.quarantined += g.quarantined_chunks;
-                        if g.quarantined_chunks > 0 {
-                            quarantined.insert(g.url.clone());
-                        }
-                        evidence.extend(g.passages);
-                    }
-                }
-            }
-
             // A time-sensitive lookup's authoritative page — the project's own
             // releases page, the vendor's pricing page — rarely survives triage:
             // its search snippet promises no version number, so a news article
@@ -7453,9 +8013,7 @@ impl Scout {
                     for page in followed {
                         report.stats.pages_fetched += 1;
                         seen_urls.insert(page.url.clone());
-                        let g = self
-                            .screen_page(&mission.query, mission.time_sensitive, false, page)
-                            .await;
+                        let g = self.screen_page(mission, page).await;
                         report.stats.chunks_examined += g.chunks_examined;
                         report.stats.quarantined += g.quarantined_chunks;
                         if g.quarantined_chunks > 0 {
@@ -7463,6 +8021,87 @@ impl Scout {
                         }
                         evidence.extend(g.passages);
                     }
+                }
+            }
+
+            // Judge every round that has evidence: which parts are still open
+            // aims the planner, decides the official-site walk, and stops the
+            // search. Assessed over `select_evidence`, the same passages the
+            // writer will get, so "answered" here means answered in the answer.
+            let mut verdict = if evidence.is_empty() {
+                None
+            } else {
+                self.assess_selected(mission, &evidence).await
+            };
+
+            // The subject's own website, once, while part of the question is
+            // open. See `walk_official_site`: third parties dominate search
+            // results for a named organisation, and the answer is often only on
+            // its own pages. The walk used to run only when round 1 had read
+            // no page of the site at all, so one hit on anfac.com ruled it out
+            // and the press-contact page holding the communications
+            // director's email was never reached (measured 2026-09-30, ANFAC:
+            // "email not found" on 3 of 4 runs). The walk aims at the parts
+            // still open.
+            //
+            // A part can open after the first walk — ANFAC's email part was
+            // judged answered in round 1 and open from round 2, and the one
+            // walk had been spent on "since when" (measured 2026-09-30) — so
+            // a second walk runs for parts no walk has aimed at yet.
+            let unwalked: Vec<String> = verdict
+                .as_ref()
+                .map(|v| {
+                    v.missing
+                        .iter()
+                        .filter(|f| !walked_for.contains(*f))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if walks < MAX_SITE_WALKS
+                && round <= 3
+                && verdict.as_ref().is_none_or(|v| v.answered < 0.7)
+                && (walks == 0 || !unwalked.is_empty())
+                && let Some(anchor) = mission
+                    .anchors
+                    .iter()
+                    .map(|a| a.trim())
+                    .find(|a| !a.is_empty())
+            {
+                walks += 1;
+                let focus: Vec<String> = unwalked;
+                walked_for.extend(focus.iter().cloned());
+                self.emit_progress(
+                    "follow",
+                    Some(round),
+                    format!("looking for {anchor}'s own website"),
+                    report.stats.pages_fetched,
+                    evidence.len(),
+                );
+                let site = self
+                    .timed(
+                        "5d walk official site",
+                        self.walk_official_site(mission, anchor, &seen_urls, &focus),
+                    )
+                    .await;
+                let walk_before = evidence.len();
+                for page in site {
+                    official_pages.push(page.clone());
+                    if !seen_urls.insert(page.url.clone()) {
+                        continue;
+                    }
+                    report.stats.pages_fetched += 1;
+                    report.stats.links_followed += 1;
+                    let g = self.screen_page(mission, page).await;
+                    report.stats.chunks_examined += g.chunks_examined;
+                    report.stats.quarantined += g.quarantined_chunks;
+                    if g.quarantined_chunks > 0 {
+                        quarantined.insert(g.url.clone());
+                    }
+                    evidence.extend(g.passages);
+                }
+                if evidence.len() > walk_before {
+                    verdict = self.assess_selected(mission, &evidence).await;
                 }
             }
 
@@ -7491,52 +8130,29 @@ impl Scout {
             // Enough good evidence is a better stop signal than a round count —
             // but only evidence for EVERY part of the question. See
             // `answer_parts`: the holistic verdict alone stopped the ElGamal
-            // run on the date and never searched for the link.
-            if evidence.len() >= 6 {
-                let verdict = self
-                    .timed("9 assess evidence", self.assess(mission, &evidence))
-                    .await;
-                if let Some(v) = verdict {
-                    let (answered, open) = Self::answer_verdict(mission, &v);
-                    if answered >= 0.7 {
-                        tracing::info!(
-                            round,
-                            answered,
-                            "answer search stopped: evidence answers every part"
-                        );
-                        break;
-                    }
-                    if !open.is_empty() {
-                        tracing::info!(round, answered, missing = ?open, "answer search continues: parts still open");
-                    }
-                    missing = open;
+            // run on the date and never searched for the link. A part judged
+            // derivable counts: searching on for a date nobody publishes is
+            // what the ICAB runs spent their rounds on.
+            if let Some(v) = verdict {
+                if v.answered >= 0.7 && evidence.len() >= 3 {
+                    tracing::info!(
+                        round,
+                        answered = v.answered,
+                        "answer search stopped: evidence answers every part"
+                    );
+                    break;
                 }
+                if !v.missing.is_empty() {
+                    tracing::info!(round, answered = v.answered, missing = ?v.missing, "answer search continues: parts still open");
+                }
+                missing = v.missing;
             }
         }
 
-        // Rank on support *and* currency, so on a time-sensitive mission the
-        // passages that still describe today reach the writer first. On every
-        // other mission `currency` is 1.0 throughout and this is the old sort.
-        evidence.sort_by(|a, b| {
-            passage_rank(b)
-                .partial_cmp(&passage_rank(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Cap how much of the evidence any single page may occupy.
-        //
-        // Without this a long, on-topic page wins every slot: each of its chunks
-        // scores well independently, so a 14-item evidence list becomes 12 chunks
-        // of one document. That looks like corroboration and is not — the answer
-        // ends up resting on a single source while appearing to cite many.
-        const MAX_PER_SOURCE: usize = 3;
-        let mut per_source: HashMap<String, usize> = HashMap::new();
-        evidence.retain(|p| {
-            let n = per_source.entry(p.url.clone()).or_insert(0);
-            *n += 1;
-            *n <= MAX_PER_SOURCE
-        });
-        evidence.truncate(14);
+        // Part coverage first, then support *and* currency, at most
+        // `MAX_PER_SOURCE` passages per page for the ranked fill. See
+        // `select_evidence`.
+        let mut evidence = self.select_for_answer(mission, &evidence);
 
         // Recency among the surviving evidence is a comparison, so the judge
         // makes it (see `pick_most_recent`) and the writer is told the outcome
@@ -7585,11 +8201,9 @@ impl Scout {
 
         let mut verdict = self
             .timed("9 assess evidence", self.assess(mission, &evidence))
-            .await;
-        let mut answered = verdict
-            .as_ref()
-            .map(|v| Self::answer_verdict(mission, v).0)
-            .unwrap_or(0.0);
+            .await
+            .map(|a| Self::answer_verdict(mission, &a));
+        let mut answered = verdict.as_ref().map(|v| v.answered).unwrap_or(0.0);
         // Evidence that does not answer, beside official pages that were read:
         // the same equivalent-term check, with the found passages first.
         if !equivalent && answered < 0.35 && !official_pages.is_empty() {
@@ -7605,15 +8219,13 @@ impl Scout {
                 .collect();
             if !found.is_empty() {
                 evidence.splice(0..0, found);
-                evidence.truncate(14);
+                evidence.truncate(EVIDENCE_CAP);
                 equivalent = true;
                 verdict = self
                     .timed("9 assess evidence", self.assess(mission, &evidence))
-                    .await;
-                answered = verdict
-                    .as_ref()
-                    .map(|v| Self::answer_verdict(mission, v).0)
-                    .unwrap_or(0.0);
+                    .await
+                    .map(|a| Self::answer_verdict(mission, &a));
+                answered = verdict.as_ref().map(|v| v.answered).unwrap_or(0.0);
             }
         }
         if equivalent {
@@ -7626,13 +8238,25 @@ impl Scout {
         }
         let open_parts = verdict
             .as_ref()
-            .map(|v| Self::answer_verdict(mission, v).1)
+            .map(|v| v.missing.clone())
             .unwrap_or_default();
-        let conflict = verdict.as_ref().map(|v| v.noul("conflict")).unwrap_or(0.0);
+        let derived_parts = verdict
+            .as_ref()
+            .map(|v| v.derived.clone())
+            .unwrap_or_default();
+        let conflict = verdict.as_ref().map(|v| v.conflict).unwrap_or(0.0);
         if !open_parts.is_empty() {
             let parts: Vec<String> = open_parts.iter().map(|f| field_words(f)).collect();
             report.notes.push(format!(
                 "Not found in the evidence: {}. The rest of the question is answered below.",
+                parts.join(", ")
+            ));
+        }
+        if !derived_parts.is_empty() {
+            let parts: Vec<String> = derived_parts.iter().map(|f| field_words(f)).collect();
+            report.notes.push(format!(
+                "Estimated, not stated: {}. No source states it outright; the answer works it \
+                 out from facts the sources do state and labels it an estimate.",
                 parts.join(", ")
             ));
         }
@@ -7661,6 +8285,12 @@ impl Scout {
             writer_note.push_str(CONFLICT_WRITER_NOTE);
         }
         if let Some(note) = missing_parts_writer_note(&open_parts) {
+            if !writer_note.is_empty() {
+                writer_note.push(' ');
+            }
+            writer_note.push_str(&note);
+        }
+        if let Some(note) = derived_parts_writer_note(&derived_parts) {
             if !writer_note.is_empty() {
                 writer_note.push(' ');
             }
@@ -7892,6 +8522,18 @@ impl Scout {
         // the reader to trust the passages over the prose.
         if still_unsupported && report.outcome == Outcome::Complete {
             report.outcome = Outcome::Partial;
+        }
+
+        // The answer itself says part of the question was not found: see
+        // `answer_admits_a_gap`. "Complete" above that sentence is a
+        // contradiction the caller cannot see without reading the prose.
+        if report.outcome == Outcome::Complete && answer_admits_a_gap(&answer) {
+            report.outcome = Outcome::Partial;
+            report.notes.push(
+                "The written answer states that part of the question was not found in the \
+                 sources; the result is reported as partial."
+                    .into(),
+            );
         }
 
         report.sources = evidence
@@ -8153,7 +8795,12 @@ impl Scout {
         let part_questions: Vec<(String, Value)> = answer_parts(mission)
             .iter()
             .enumerate()
-            .map(|(i, f)| (format!("part{i}"), answer_part_question(f)))
+            .flat_map(|(i, f)| {
+                [
+                    (format!("part{i}"), answer_part_question(f)),
+                    (format!("derive{i}"), answer_derivable_question(f)),
+                ]
+            })
             .collect();
         self.jev
             .ask(
@@ -8167,7 +8814,7 @@ impl Scout {
                         "answered".into(),
                         noul(
                             "Taken together, does `evidence` answer `question`?",
-                            "A reader could state the answer from this evidence alone. A resolved negative counts: when `evidence` is the authoritative place the asked-about fact would appear and the fact is absent there — the organisation's own contact page lists its addresses and does not list the one asked about — the answer is 'no', and it is stated from the evidence.",
+                            "A reader could state the answer from this evidence alone — a piece that follows from stated facts by simple date or arithmetic reasoning counts, given as an estimate. A resolved negative counts: when `evidence` is the authoritative place the asked-about fact would appear and the fact is absent there — the organisation's own contact page lists its addresses and does not list the one asked about — the answer is 'no', and it is stated from the evidence.",
                             "The evidence is related but leaves what was asked unresolved: it neither states the answer nor rules it out.",
                         ),
                     ),
@@ -8190,24 +8837,69 @@ impl Scout {
     ///
     /// Jev judges each part; this code only combines (`answered_across_parts`)
     /// and names what is missing, so the next round's planner can aim at it.
-    fn answer_verdict(mission: &Mission, verdict: &Answers) -> (f64, Vec<String>) {
+    /// A part that is not stated but judged derivable (`derive{i}` ≥
+    /// `DERIVABLE_FLOOR`) counts as answered and is listed in `derived`, so
+    /// the writer is told to work it out and label it.
+    fn answer_verdict(mission: &Mission, verdict: &Answers) -> AnswerVerdict {
         let parts = answer_parts(mission);
-        let scores: Vec<Option<f64>> = (0..parts.len())
-            .map(|i| {
-                let id = format!("part{i}");
-                verdict.is_sane(&id).then(|| verdict.noul(&id))
-            })
-            .collect();
-        let missing = parts
-            .iter()
-            .zip(&scores)
-            .filter(|(_, s)| s.is_none_or(|p| p < 0.7))
-            .map(|(f, _)| f.clone())
-            .collect();
-        (
-            answered_across_parts(verdict.noul("answered"), &scores),
+        let mut scores: Vec<Option<f64>> = Vec::with_capacity(parts.len());
+        let mut missing = Vec::new();
+        let mut derived = Vec::new();
+        for (i, f) in parts.iter().enumerate() {
+            let id = format!("part{i}");
+            let stated = verdict.is_sane(&id).then(|| verdict.noul(&id));
+            let did = format!("derive{i}");
+            let derivable = verdict.is_sane(&did).then(|| verdict.noul(&did));
+            let is_stated = stated.is_some_and(|p| p >= 0.7);
+            let is_derived = !is_stated && derivable.is_some_and(|d| d >= DERIVABLE_FLOOR);
+            if is_derived {
+                derived.push(f.clone());
+            } else if !is_stated {
+                missing.push(f.clone());
+            }
+            scores.push(match (stated, is_derived) {
+                (_, true) => derivable,
+                (s, false) => s,
+            });
+        }
+        let v = AnswerVerdict {
+            answered: answered_across_parts(verdict.noul("answered"), &scores),
             missing,
+            derived,
+            conflict: verdict.noul("conflict"),
+        };
+        tracing::info!(
+            answered = v.answered,
+            holistic = verdict.noul("answered"),
+            missing = ?v.missing,
+            derived = ?v.derived,
+            "evidence assessed per part"
+        );
+        v
+    }
+
+    /// The evidence the writer would get from `evidence` right now: see
+    /// `select_evidence`.
+    fn select_for_answer(&self, mission: &Mission, evidence: &[Passage]) -> Vec<Passage> {
+        select_evidence(
+            evidence,
+            answer_parts(mission).len(),
+            EVIDENCE_CAP,
+            MAX_PER_SOURCE,
+            self.t().keep_support,
         )
+    }
+
+    /// `assess` over the evidence the writer would get, read per part.
+    async fn assess_selected(
+        &self,
+        mission: &Mission,
+        evidence: &[Passage],
+    ) -> Option<AnswerVerdict> {
+        let selected = self.select_for_answer(mission, evidence);
+        self.timed("9 assess evidence", self.assess(mission, &selected))
+            .await
+            .map(|a| Self::answer_verdict(mission, &a))
     }
 
     /// Write the answer from the cleared evidence.
@@ -8224,8 +8916,17 @@ impl Scout {
     ) -> Result<String> {
         let mut body = String::new();
         for (i, p) in evidence.iter().enumerate() {
+            // A passage Jev read as describing a superseded state of affairs
+            // is kept (it may be the only record of when something began or
+            // what came before) and labelled, so the writer uses it as
+            // history rather than as the current state. See `screen_verdict`.
+            let dated = if p.currency < self.t().currency_floor {
+                " (older source: may describe a state of affairs that has since changed)"
+            } else {
+                ""
+            };
             body.push_str(&format!(
-                "\n[{}] {} — {}\n{}\n",
+                "\n[{}] {} — {}{dated}\n{}\n",
                 i + 1,
                 p.title,
                 p.url,
@@ -8346,14 +9047,7 @@ impl Scout {
         let mut kept_pages = pages.clone();
 
         let mut gathered = stream::iter(pages)
-            .map(|page| {
-                self.screen_page(
-                    &mission.query,
-                    mission.time_sensitive,
-                    mission.is_harvest(),
-                    page,
-                )
-            })
+            .map(|page| self.screen_page(mission, page))
             .buffer_unordered(self.t().concurrency)
             .collect::<Vec<PagePassages>>()
             .await;
@@ -8393,14 +9087,7 @@ impl Scout {
                 } else {
                     page.requested_url.clone()
                 };
-                let g = self
-                    .screen_page(
-                        &mission.query,
-                        mission.time_sensitive,
-                        mission.is_harvest(),
-                        page.clone(),
-                    )
-                    .await;
+                let g = self.screen_page(mission, page.clone()).await;
                 kept_pages.push(page);
                 if let Some(slot) = gathered.iter_mut().find(|s| s.url == key) {
                     *slot = g;
@@ -8511,17 +9198,19 @@ impl Scout {
     }
 
     /// Screen one fetched page into passages: chunk, injection-screen,
-    /// currency-drop, support-keep.
+    /// support-keep (on the question or any one of its parts).
     ///
     /// Shared by the search path and the answer-path link following, so no
     /// fetch route into the evidence set bypasses the guards.
     async fn screen_page(
         &self,
-        query: &str,
-        time_sensitive: bool,
-        harvest: bool,
+        mission: &Mission,
         page: crate::browser::PageContent,
     ) -> PagePassages {
+        let query = mission.query.as_str();
+        let time_sensitive = mission.time_sensitive;
+        let harvest = mission.is_harvest();
+        let parts = answer_parts(mission);
         let cap = self.t().chunk_cap(harvest);
         // A harvest keeps the first `cap` chunks: its value is the long tail
         // of a register, read in order. An answer keeps the head and the last
@@ -8544,7 +9233,7 @@ impl Scout {
         let screened = self
             .timed(
                 "6 screen chunks",
-                self.screen_passages(query, &chunks, time_sensitive, &page.title),
+                self.screen_passages(query, &chunks, time_sensitive, &page.title, &parts),
             )
             .await;
         let mut quarantined: Vec<String> = Vec::new();
@@ -8555,7 +9244,7 @@ impl Scout {
         // overlap decides nothing here.
         if tracing::enabled!(tracing::Level::DEBUG) {
             let qterms = query_content_terms(query);
-            for (i, triple) in screened.iter().enumerate() {
+            for (i, s) in screened.iter().enumerate() {
                 let folded = fold_ascii_lower(&chunks[i]);
                 let hits = qterms
                     .iter()
@@ -8565,44 +9254,38 @@ impl Scout {
                     url = %page.url,
                     chunk = i,
                     chars = chunks[i].len(),
-                    supports = triple.1,
-                    injection = triple.0,
+                    supports = s.supports,
+                    best_part = s.best_part(),
+                    currency = s.currency,
+                    injection = s.injection,
                     overlap = hits,
                     terms = qterms.len(),
-                    verdict = ?screen_verdict(&self.t(), triple),
+                    verdict = ?screen_verdict(&self.t(), s),
                     "screen chunk"
                 );
             }
         }
-        for (i, triple) in screened.iter().enumerate() {
-            match screen_verdict(&self.t(), triple) {
+        let passage_of = |text: &str, s: &Screened| Passage {
+            // Cleaned here, at the one place page text becomes citable
+            // evidence: the writer quotes a passage's URL into the prose,
+            // and `report.sources` is built from these same passages, so
+            // cleaning once upstream keeps the link in the answer, the
+            // link in the source list and the provenance identical.
+            url: crate::browser::display_url(&page.url),
+            title: page.title.clone(),
+            text: text.to_string(),
+            supports: s.supports,
+            injection: s.injection,
+            currency: s.currency,
+            part_support: s.parts.clone(),
+        };
+        for (i, s) in screened.iter().enumerate() {
+            match screen_verdict(&self.t(), s) {
                 ScreenVerdict::Quarantined => {
                     out.quarantined_chunks += 1;
                     quarantined.push(chunks[i].clone());
                 }
-                // A stale passage is dropped, not quarantined: it is not
-                // hostile, it is just describing a world that has moved on.
-                // The floor is low on purpose — see `Tunables::currency_floor`.
-                ScreenVerdict::Stale => {
-                    tracing::debug!(
-                        url = %page.url,
-                        currency = triple.2,
-                        "passage describes a superseded state of affairs; dropped"
-                    );
-                }
-                // Cleaned here, at the one place page text becomes citable
-                // evidence: the writer quotes a passage's URL into the prose,
-                // and `report.sources` is built from these same passages, so
-                // cleaning once upstream keeps the link in the answer, the
-                // link in the source list and the provenance identical.
-                ScreenVerdict::Kept => out.passages.push(Passage {
-                    url: crate::browser::display_url(&page.url),
-                    title: page.title.clone(),
-                    text: chunks[i].clone(),
-                    supports: triple.1,
-                    injection: triple.0,
-                    currency: triple.2,
-                }),
+                ScreenVerdict::Kept => out.passages.push(passage_of(&chunks[i], s)),
                 ScreenVerdict::NotSupportive => {}
             }
         }
@@ -8610,69 +9293,61 @@ impl Scout {
         // One level down: a quarantined chunk may be mostly legitimate text
         // with one poisoned paragraph inside it (see `resplit_chunk`). The
         // sub-chunks are screened by the same function at the same
-        // thresholds, so a paragraph re-enters only by passing the injection,
-        // currency and support gates alone — the quarantined chunk itself is
-        // never readmitted whole.
+        // thresholds, so a paragraph re-enters only by passing the injection
+        // and support gates alone — the quarantined chunk itself is never
+        // readmitted whole.
         if !quarantined.is_empty() {
             let subs: Vec<String> = quarantined.iter().flat_map(|t| resplit_chunk(t)).collect();
             out.chunks_examined += subs.len();
             let rescreened = self
                 .timed(
                     "6 screen chunks",
-                    self.screen_passages(query, &subs, time_sensitive, &page.title),
+                    self.screen_passages(query, &subs, time_sensitive, &page.title, &parts),
                 )
                 .await;
-            for (i, triple) in rescreened.iter().enumerate() {
-                match screen_verdict(&self.t(), triple) {
+            for (i, s) in rescreened.iter().enumerate() {
+                match screen_verdict(&self.t(), s) {
                     ScreenVerdict::Quarantined => out.quarantined_chunks += 1,
-                    ScreenVerdict::Stale => {}
                     ScreenVerdict::Kept => {
                         tracing::debug!(
                             url = %page.url,
-                            supports = triple.1,
+                            supports = s.supports,
                             "paragraph readmitted after chunk-level quarantine"
                         );
-                        out.passages.push(Passage {
-                            url: crate::browser::display_url(&page.url),
-                            title: page.title.clone(),
-                            text: subs[i].clone(),
-                            supports: triple.1,
-                            injection: triple.0,
-                            currency: triple.2,
-                        });
+                        out.passages.push(passage_of(&subs[i], s));
                     }
                     ScreenVerdict::NotSupportive => {}
                 }
             }
         }
-        // The four ways a fetched page can end up contributing nothing are
+        // The three ways a fetched page can end up contributing nothing are
         // otherwise indistinguishable from the log: no chunks, all chunks
-        // quarantined, all dropped at currency, or all below the support
-        // floor. Say which, with the best support seen — the numbers are what
-        // turned "the authoritative page was read but vanished" into a
-        // five-minute diagnosis instead of an hour of guessing.
+        // quarantined, or all below the support floor. Say which, with the
+        // best support seen — the numbers are what turned "the authoritative
+        // page was read but vanished" into a five-minute diagnosis instead of
+        // an hour of guessing.
         if out.passages.is_empty() {
             // Each metric names one guard: worst injection vs
-            // `injection_ceiling`, best currency vs `currency_floor`, best
-            // support vs `keep_support`. A silent kill was the 2026-09-21
-            // Zisk diagnosis: a 0.69-support chunk died at injection and
-            // only the disclaimer's imperative wording ("Users should
-            // evaluate… at their own discretion") explained it.
+            // `injection_ceiling`, best support (whole or any part) vs
+            // `keep_support`. A silent kill was the 2026-09-21 Zisk
+            // diagnosis: a 0.69-support chunk died at injection and only the
+            // disclaimer's imperative wording ("Users should evaluate… at
+            // their own discretion") explained it.
             let mut best_support = 0.0_f64;
+            let mut best_part = 0.0_f64;
             let mut worst_injection = 0.0_f64;
-            let mut best_currency = 1.0_f64;
-            for (inj, sup, cur) in screened.iter() {
-                best_support = best_support.max(*sup);
-                worst_injection = worst_injection.max(*inj);
-                best_currency = best_currency.min(*cur);
+            for s in screened.iter() {
+                best_support = best_support.max(s.supports);
+                best_part = best_part.max(s.best_part());
+                worst_injection = worst_injection.max(s.injection);
             }
             tracing::debug!(
                 url = %page.url,
                 chunks = chunks.len(),
                 rendered = page.rendered,
                 best_support,
+                best_part,
                 worst_injection,
-                best_currency,
                 "page yielded no passages"
             );
         }
@@ -8864,11 +9539,17 @@ impl Scout {
     /// chosen by one Jev noul per same-site link. The judge never invents a
     /// URL; code offers the links the pages carry. Returns every page read;
     /// the caller screens them like any other page.
+    ///
+    /// `focus` names the parts of the question still open; when set, links
+    /// are judged by whether they lead to those parts, so a walk started for
+    /// a communications director's email heads for the press room rather than
+    /// back to the leadership page already read.
     async fn walk_official_site(
         &self,
         mission: &Mission,
         anchor: &str,
         seen_urls: &HashSet<String>,
+        focus: &[String],
     ) -> Vec<crate::browser::PageContent> {
         let Some(home) = self.find_official_site(anchor).await else {
             tracing::info!(subject = %anchor, "no official site found to walk");
@@ -8890,7 +9571,7 @@ impl Scout {
             if cands.is_empty() {
                 break;
             }
-            let mut scored = self.score_site_links(mission, anchor, &cands).await;
+            let mut scored = self.score_site_links(mission, anchor, &cands, focus).await;
             scored.retain(|(_, s)| *s >= floor);
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let picked: Vec<String> = scored
@@ -8925,7 +9606,10 @@ impl Scout {
         mission: &Mission,
         anchor: &str,
         cands: &[(String, String)],
+        focus: &[String],
     ) -> Vec<(usize, f64)> {
+        let still_missing: Vec<String> = focus.iter().map(|f| field_words(f)).collect();
+        let still_missing = &still_missing;
         let state_costs: Vec<usize> = cands.iter().map(|(h, t)| h.len() + t.len() + 32).collect();
         let total_costs: Vec<usize> = state_costs.iter().map(|c| c + 200).collect();
         let batches = plan_batches_dual(
@@ -8956,7 +9640,8 @@ impl Scout {
                                              `subject`. Would following it reach a page that answers \
                                              `request`, in whole or in part — or a section of the site \
                                              (about us, team, organisation, governance, contact, press) \
-                                             that leads to such a page?"
+                                             that leads to such a page? When `still_missing` is given, \
+                                             only those parts of the request count."
                                         ),
                                         "yes: it reaches the answer, or the section of the site where it would be",
                                         "no: it reaches something unrelated to the request (products, \
@@ -8965,11 +9650,16 @@ impl Scout {
                                 )
                             })
                             .collect();
-                        let state = json!({
+                        let mut state = json!({
                             "subject": anchor,
                             "request": mission.query,
                             "links": items,
                         });
+                        // The request's open parts, when known: a link to the
+                        // part already answered is not worth a read.
+                        if !still_missing.is_empty() {
+                            state["still_missing"] = json!(still_missing);
+                        }
                         let a = self.jev.ask(state, crate::typesafe::questions(qs)).await?;
                         Ok(sub
                             .iter()
@@ -9151,6 +9841,7 @@ impl Scout {
                     supports: eq,
                     injection: inj,
                     currency: 1.0,
+                    part_support: Vec::new(),
                 }
             })
             .collect();
@@ -9280,24 +9971,29 @@ impl Scout {
 
     /// Batched relevance + injection screening for answer missions.
     ///
-    /// Returns `(injection, supports, currency)` per chunk. `currency` is 1.0
-    /// unless `time_sensitive` is set, because the third question costs one more
+    /// Returns a `Screened` per chunk. `currency` is 1.0 unless
+    /// `time_sensitive` is set, because the third question costs one more
     /// per chunk — on a 10-chunk page that is a 50 % increase in screening
     /// questions, which is not worth paying to ask whether a definition of TLS is
-    /// out of date.
+    /// out of date. `parts` (field names, see `answer_parts`) adds one noul per
+    /// part per chunk when the question has two or more; the chunk text is
+    /// already in the request, so each costs only its question's tokens.
     async fn screen_passages(
         &self,
         question: &str,
         chunks: &[String],
         time_sensitive: bool,
         page_title: &str,
-    ) -> Vec<(f64, f64, f64)> {
+        parts: &[String],
+    ) -> Vec<Screened> {
         use futures::stream::{self, StreamExt};
 
+        let parts: &[String] = if parts.len() >= 2 { parts } else { &[] };
         // Same accounting as the harvest screen: measured, questions included.
-        // The currency question is budgeted at the same size as the two fixed
-        // ones, which over-reserves slightly and never under-reserves.
-        let per_q = screen_question_cost(0) * if time_sensitive { 3 } else { 2 } / 2;
+        // The currency and part questions are budgeted at the size of the two
+        // fixed ones, which over-reserves slightly and never under-reserves.
+        let per_chunk_qs = 2 + usize::from(time_sensitive) + parts.len();
+        let per_q = screen_question_cost(0) * per_chunk_qs / 2;
         let state_costs: Vec<usize> = chunks
             .iter()
             .map(|c| crate::typesafe::state_cost(c) + 2)
@@ -9306,13 +10002,15 @@ impl Scout {
         let batches = plan_batches_dual(
             &state_costs,
             &total_costs,
-            self.t().max_questions_per_request / if time_sensitive { 3 } else { 2 },
+            (self.t().max_questions_per_request / per_chunk_qs).max(1),
             self.jev.state_budget_chars().saturating_sub(4_000),
             self.jev.request_budget_chars().saturating_sub(8_000),
         );
+        let part_words: Vec<String> = parts.iter().map(|f| field_words(f)).collect();
+        let part_words = &part_words;
 
         let today = self.today.as_str();
-        let results: Vec<Vec<(usize, f64, f64, f64)>> = stream::iter(batches)
+        let results: Vec<Vec<(usize, Screened)>> = stream::iter(batches)
             .map(|idxs| async move {
                 split_on_oversize(
                     idxs,
@@ -9356,6 +10054,12 @@ impl Scout {
                                     ),
                                 ));
                             }
+                            for (k, words) in part_words.iter().enumerate() {
+                                qs.push((
+                                    format!("pt{slot}_{k}"),
+                                    screen_part_question(slot, words),
+                                ));
+                            }
                         }
                         let a = self
                             .jev
@@ -9379,32 +10083,40 @@ impl Scout {
                             .iter()
                             .enumerate()
                             .map(|(slot, &i)| {
-                                (
-                                    i,
-                                    if a.is_sane(&format!("inj{slot}")) {
+                                let s = Screened {
+                                    injection: if a.is_sane(&format!("inj{slot}")) {
                                         a.noul(&format!("inj{slot}"))
                                     } else {
                                         1.0
                                     },
-                                    a.noul(&format!("sup{slot}")),
+                                    supports: a.noul(&format!("sup{slot}")),
                                     // Not asked, or unanswered, means "no reason to
                                     // think it is stale" — 1.0. Unlike the injection
                                     // check, a missing currency answer is not a safety
                                     // hole: the worst case is that an out-of-date
                                     // passage keeps its place in the ranking, which is
                                     // exactly the pre-existing behaviour.
-                                    if time_sensitive {
+                                    currency: if time_sensitive {
                                         a.noul_or(&format!("cur{slot}"), 1.0)
                                     } else {
                                         1.0
                                     },
-                                )
+                                    // An unanswered part reads as 0: the passage
+                                    // then has to earn its place on `supports`.
+                                    parts: (0..part_words.len())
+                                        .map(|k| a.noul_or(&format!("pt{slot}_{k}"), 0.0))
+                                        .collect(),
+                                };
+                                (i, s)
                             })
                             .collect())
                     },
                     |batch, e| {
                         tracing::warn!(error = %e, count = batch.len(), "passage screening failed; treating items as unsafe");
-                        batch.iter().map(|&i| (i, 1.0, 0.0, 1.0)).collect()
+                        batch
+                            .iter()
+                            .map(|&i| (i, Screened::failed(part_words.len())))
+                            .collect()
                     },
                 )
                 .await
@@ -9413,9 +10125,9 @@ impl Scout {
             .collect()
             .await;
 
-        let mut out = vec![(1.0, 0.0, 1.0); chunks.len()];
-        for (i, inj, sup, cur) in results.into_iter().flatten() {
-            out[i] = (inj, sup, cur);
+        let mut out = vec![Screened::failed(part_words.len()); chunks.len()];
+        for (i, s) in results.into_iter().flatten() {
+            out[i] = s;
         }
         out
     }
@@ -9854,6 +10566,7 @@ impl Scout {
         tried: &HashSet<String>,
         productive: &HashMap<String, usize>,
         missing: &[String],
+        known: &[Passage],
     ) -> Result<Vec<String>> {
         // Two separate lists, because asking for one list and hoping for a good mix
         // does not work. Observed failure: once one domain proved productive, the
@@ -9871,7 +10584,16 @@ impl Scout {
         });
 
         let mut context = format!("GOAL: {}\nTOPIC: {}\n", mission.query, mission.topic);
-        if !mission.constraints.is_empty() {
+        if mission.is_harvest() {
+            let listable = listable_constraints(mission);
+            if !listable.is_empty() {
+                context.push_str(&format!("CONSTRAINTS: {}\n", listable.join("; ")));
+            }
+            let note = per_entity_note(mission);
+            if !note.is_empty() {
+                context.push_str(&format!("{note}\n"));
+            }
+        } else if !mission.constraints.is_empty() {
             context.push_str(&format!(
                 "CONSTRAINTS: {}\n",
                 mission.constraints.join("; ")
@@ -9890,6 +10612,33 @@ impl Scout {
                  finding exactly that; the rest of the goal is already covered.\n",
                 parts.join(", ")
             ));
+        }
+        // What the sources read so far say, so a follow-up can be aimed with
+        // it. A question with a hop in it — "since when" for a director the
+        // run has only just identified, the email of a communications
+        // director whose name is on a page already read — is searched by
+        // name, and the planner only knew a passage count: measured
+        // 2026-09-30 (ANFAC), six rounds searched "ANFAC director general
+        // nombramiento 2021/2020/2019" and "ANFAC director comunicación
+        // email" without ever naming José López-Tafall or Félix García, both
+        // already in the evidence. Screened passages only; the planner writes
+        // queries, which are still anchored and Jev-gated.
+        if !known.is_empty() && !missing.is_empty() {
+            context.push_str(
+                "FOUND SO FAR (excerpts of the sources already read; use the names, titles and \
+                 dates in them to aim follow-up searches at what is still missing):\n",
+            );
+            for p in known.iter().take(PLANNER_KNOWN_PASSAGES) {
+                let excerpt: String = p
+                    .text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(PLANNER_EXCERPT_CHARS)
+                    .collect();
+                context.push_str(&format!("- {} ({}): {}\n", p.title, p.url, excerpt));
+            }
         }
         if !tried.is_empty() {
             let mut sample: Vec<&String> = tried.iter().collect();
@@ -10197,22 +10946,78 @@ impl Scout {
 /// entity: one contains the other as a prefix/suffix/substring, or they share
 /// at least 60% of tokens by intersection over min. Pure text — no Jev cost
 /// — this is only the pre-filter that decides which pairs deserve a question.
+/// `near_collision_in` with no token discounted: the raw-token predicate,
+/// kept for the tests that pin its shape.
+#[cfg(test)]
 pub(crate) fn near_collision(a: &str, b: &str) -> bool {
+    near_collision_in(a, b, &HashSet::new())
+}
+
+/// `near_collision` over the tokens that tell entities apart in this store:
+/// `common` holds the tokens too frequent across the store's keys to carry
+/// identity (`common_name_tokens`). Both names must keep at least one
+/// distinctive token, and the overlap is measured on those alone.
+///
+/// Measured 2026-09-30 (Q3, ~100 Aragón colegios): on raw tokens every
+/// "colegio oficial de X de aragon" collided with every other (4 of 5
+/// tokens shared), the run asked 41,976 merge questions, and in batches of
+/// up to 192 Jev scored Geólogos/Médicos, Economistas/Trabajo Social and
+/// Notarial/Farmacéuticos at 1.57-1.72 — merges that fed one college's email,
+/// website and election year to another. The same pairs asked alone scored
+/// 0.0.
+pub(crate) fn near_collision_in(a: &str, b: &str, common: &HashSet<String>) -> bool {
     if a.is_empty() || b.is_empty() || a == b {
+        return false;
+    }
+    let ta: HashSet<&str> = a
+        .split_whitespace()
+        .filter(|t| !common.contains(*t))
+        .collect();
+    let tb: HashSet<&str> = b
+        .split_whitespace()
+        .filter(|t| !common.contains(*t))
+        .collect();
+    if ta.is_empty() || tb.is_empty() {
+        return false;
+    }
+    let inter = ta.intersection(&tb).count();
+    if inter == 0 {
         return false;
     }
     if a.contains(b) || b.contains(a) {
         return true;
     }
-    let ta: HashSet<&str> = a.split_whitespace().collect();
-    let tb: HashSet<&str> = b.split_whitespace().collect();
-    if ta.is_empty() || tb.is_empty() {
-        return false;
-    }
-    let inter = ta.intersection(&tb).count();
     let min = ta.len().min(tb.len());
     (inter as f64) / (min as f64) >= 0.6
 }
+
+/// Tokens that appear in so many of the store's keys that they name the
+/// category, the region or the grammar rather than an entity: in at least
+/// `COMMON_TOKEN_MIN_KEYS` keys and at least `COMMON_TOKEN_SHARE` of them.
+fn common_name_tokens(keys: &[String]) -> HashSet<String> {
+    let mut df: HashMap<&str, usize> = HashMap::new();
+    for k in keys {
+        let uniq: HashSet<&str> = k.split_whitespace().collect();
+        for t in uniq {
+            *df.entry(t).or_insert(0) += 1;
+        }
+    }
+    let floor = COMMON_TOKEN_MIN_KEYS.max((keys.len() as f64 * COMMON_TOKEN_SHARE).ceil() as usize);
+    df.into_iter()
+        .filter(|(_, n)| *n >= floor)
+        .map(|(t, _)| t.to_string())
+        .collect()
+}
+
+/// See `common_name_tokens`. Four keys and a tenth of the store: in a
+/// 12-record store a token in 4 names is common; in a 100-record store, 10.
+const COMMON_TOKEN_MIN_KEYS: usize = 4;
+const COMMON_TOKEN_SHARE: f64 = 0.1;
+
+/// Most name pairs one merge request carries. Asked in batches of up to
+/// 192, obviously different colleges scored 1.57-1.72 on the 0-2 scale; one
+/// at a time, 0.0 (measured 2026-09-30, see `near_collision_in`).
+const MERGE_PAIRS_PER_REQUEST: usize = 24;
 
 /// Decide whether the record already in the store should keep its slot when a
 /// new record with the same normalised entity key arrives.
@@ -10268,6 +11073,47 @@ pub(crate) fn is_complete(record: &Record, mission: &Mission) -> bool {
         .fields
         .iter()
         .all(|f| record.fields.get(f).is_some_and(|v| !v.trim().is_empty()))
+}
+
+/// Why a record is or is not complete, in words a reader of the table can
+/// act on: "complete", "related organisation", "missing: email, website",
+/// "unverified: will hold elections in 2026 or 2027". Mirrors `is_complete`.
+///
+/// A list cut to the requested count shows complete records first and then
+/// the rest; without a status the rest read as results. Measured 2026-09-30
+/// (Q3 feedback): rows whose election year was 2023 or 2018 were delivered
+/// beside the 2026/2027 ones with nothing to tell them apart — their
+/// constraint was `not_addressed`, never supported.
+pub(crate) fn record_status(record: &Record, mission: &Mission) -> String {
+    if record.entity_binding == EntityBinding::Related {
+        return "related organisation, not the entity itself".to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let unverified: Vec<String> = record
+        .constraint_status
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !v.is_satisfied())
+        .filter_map(|(i, _)| mission.constraints.get(i))
+        .map(|c| c.chars().take(60).collect())
+        .collect();
+    if !unverified.is_empty() {
+        parts.push(format!("unverified: {}", unverified.join("; ")));
+    }
+    let missing: Vec<String> = mission
+        .fields
+        .iter()
+        .filter(|f| record.fields.get(*f).is_none_or(|v| v.trim().is_empty()))
+        .map(|f| field_words(f))
+        .collect();
+    if !missing.is_empty() {
+        parts.push(format!("missing: {}", missing.join(", ")));
+    }
+    if parts.is_empty() {
+        "complete".to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 /// Count of records in the store that are complete against the mission.
@@ -10842,10 +11688,11 @@ impl Scout {
         // `shared_email_pairs`). The third tuple slot carries the shared
         // address for the email pairs and is None for name pairs, because the
         // two cases need different questions.
+        let common = common_name_tokens(&keys);
         let mut pairs: Vec<(String, String, Option<String>)> = Vec::new();
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
-                if near_collision(&keys[i], &keys[j]) {
+                if near_collision_in(&keys[i], &keys[j], &common) {
                     pairs.push((keys[i].clone(), keys[j].clone(), None));
                 }
             }
@@ -10875,7 +11722,7 @@ impl Scout {
         let batches = plan_batches_dual(
             &state_costs,
             &total_costs,
-            self.t().max_questions_per_request,
+            MERGE_PAIRS_PER_REQUEST.min(self.t().max_questions_per_request),
             self.jev.state_budget_chars().saturating_sub(4_000),
             self.jev.request_budget_chars().saturating_sub(8_000),
         );
@@ -12107,16 +12954,32 @@ impl Scout {
                         "required": ["value"],
                         "additionalProperties": false
                     });
+                    // The request rides along so the field is read as the
+                    // request means it, and a value the page settles without
+                    // printing may be worked out — labelled — rather than
+                    // replaced by a neighbouring fact. Measured 2026-09-30
+                    // (Q3, "colleges that will hold elections in 2026 or
+                    // 2027 … the election year"): pages stating "Junta de
+                    // Gobierno 2023-2027" or "elected in 2023 for four years"
+                    // were enriched as `election_year=2023`, the LAST election,
+                    // so no record could be verified against the constraint;
+                    // the reference answer read the same pages as 2027.
                     let prompt = format!(
-                        "The request asks for a field named `{field}` — in plain words: \"{}\". \
-                         Extract that field's value for the entity below from the page text, if it is written there. \
-                         Return a short value (a word, yes/no, a year, a number — never a sentence or a marketing \
-                         tagline). Copy the value as the page states it. Do not guess. If the page does not state \
+                        "The request: {request}\n\n\
+                         It asks for a field named `{field}` — in plain words: \"{}\", meant as the request \
+                         means it. Extract that field's value for the entity below from the page text, if it is \
+                         written there. Return a short value (a word, yes/no, a year, a number — never a sentence \
+                         or a marketing tagline). Copy the value as the page states it. If the page does not state \
+                         it but states the facts it follows from by simple date or arithmetic reasoning (a board \
+                         elected in 2023 for four years: its next election is due in 2027), return the worked-out \
+                         value followed by \" (estimated: \" and those facts, e.g. \"2027 (estimated: elected 2023, \
+                         four-year term)\". Never guess beyond what the page states. If the page does not settle \
                          this field for this entity, return an empty string.\n\n\
                          ENTITY: {entity}\n\
                          TOPIC: {topic}\n\n\
                          PAGE TEXT:\n{text}",
                         field_words(&field),
+                        request = mission.query,
                     );
                     #[derive(Deserialize)]
                     struct Out { value: String }
@@ -12153,7 +13016,19 @@ impl Scout {
                     // the {field} of {entity}? Windowed for the same reason
                     // as the pick state above — measured q56: whole-page
                     // states here failed oversized fourteen times in one run.
-                    let atext = text_window(&text, &[val.as_str()], 6000);
+                    // An estimate is not written in the text as such; its
+                    // window centres on the numbers its basis names.
+                    let estimated = val.contains("(estimated");
+                    let needles: Vec<String> = if estimated {
+                        val.split(|c: char| !c.is_ascii_digit())
+                            .filter(|t| t.len() == 4)
+                            .map(str::to_string)
+                            .collect()
+                    } else {
+                        vec![val.clone()]
+                    };
+                    let needle_refs: Vec<&str> = needles.iter().map(String::as_str).collect();
+                    let atext = text_window(&text, &needle_refs, 6000);
                     let state = json!({
                         "entity": entity,
                         "field": field,
@@ -12165,21 +13040,45 @@ impl Scout {
                     });
                     let q = noul(
                         "Is `value` stated in `text` as the `field` of `entity`?",
-                        "The text ties this exact value to that entity as its field, not to some other item or generic mention.",
-                        "The text does not say this, states it about someone else, or the value is only mentioned in passing.",
+                        "The text ties this exact value to that entity as its field, not to some other item or generic mention. A value labelled \"(estimated: …)\" counts when the facts it names are stated in the text about this entity and the value follows from them by simple date or arithmetic reasoning.",
+                        "The text does not say this, states it about someone else, or the value is only mentioned in passing; or an estimate's facts are not in the text, or it does not follow from them.",
                     );
+                    // The same binding the regex path asks: a page of the
+                    // national college, or of another college altogether, can
+                    // state an election year perfectly clearly — for someone
+                    // else. This path used to accept on association alone.
+                    let bq = entity_binding(&entity, topic, "text");
                     match self
                         .jev
-                        .ask(state, crate::typesafe::questions(vec![("assoc".to_string(), q)]))
+                        .ask(
+                            state,
+                            crate::typesafe::questions(vec![
+                                ("assoc".to_string(), q),
+                                ("binding".to_string(), bq),
+                            ]),
+                        )
                         .await
                     {
                         Ok(a) => {
                             let prob = a.noul("assoc");
-                            if prob < grounding_floor {
-                                tracing::debug!(entity = %entity, field = %field, prob, "non-regex enrich below floor");
+                            let binding = if a.is_sane("binding") {
+                                EntityBinding::from_choice(&a.choice("binding"))
+                            } else {
+                                EntityBinding::Unresolved
+                            };
+                            let floor = match binding_gate(binding) {
+                                BindingGate::Reject => {
+                                    tracing::debug!(entity = %entity, field = %field, value = %val, binding = binding.as_str(), "non-regex enrich: page organisation is not the entity");
+                                    return (pi, Some(EnrichOutcome::WrongEntity));
+                                }
+                                BindingGate::Stricter => grounding_floor.max(UNRESOLVED_BINDING_FLOOR),
+                                BindingGate::Accept => grounding_floor,
+                            };
+                            if prob < floor {
+                                tracing::debug!(entity = %entity, field = %field, prob, floor, "non-regex enrich below floor");
                                 return (pi, None);
                             }
-                            tracing::debug!(entity = %entity, field = %field, value = %val, prob, "non-regex enrich pick");
+                            tracing::debug!(entity = %entity, field = %field, value = %val, prob, estimated, "non-regex enrich pick");
                             (pi, Some(EnrichOutcome::Picked(val, page.url.clone(), prob)))
                         }
                         Err(e) => {
@@ -13105,14 +14004,16 @@ impl Scout {
             &mission.entity_type
         };
         let anchors = mission.anchors.join(", ");
-        let filters = mission.constraints.join("; ");
+        let filters = listable_constraints(mission).join("; ");
+        let per_entity = per_entity_note(mission);
         let scope = mission.scope.trim();
         let today = &self.today;
         let prompt = format!(
             "Today's date is {today}; prefer sources that are maintained rather \
              than snapshots of an earlier state.\n\n\
              You are a research librarian. The user needs a comprehensive list of \
-             {entity_type}{anchors_frag}{filters_frag}{scope_frag}.\n\n\
+             {entity_type}{anchors_frag}{filters_frag}{scope_frag}.\n\
+             {per_entity}\n\n\
              Where on the web would a complete list of these be published, and why? \
              Think about who has an incentive to publish it: the vendor or \
              organisation itself (partners / members / customers pages), public \
@@ -13293,7 +14194,8 @@ impl Scout {
             mission.entity_type.as_str()
         };
         let anchors = mission.anchors.join(", ");
-        let filters = mission.constraints.join("; ");
+        let filters = listable_constraints(mission).join("; ");
+        let per_entity = per_entity_note(mission);
         let tried_list = tried_this_round
             .iter()
             .map(|q| format!("  - {q}"))
@@ -13308,7 +14210,8 @@ impl Scout {
             "You are the research planner. The user wants: {request}\n\
              Entity type: {entity_type}\n\
              Anchor(s): {anchors}\n\
-             Filter(s): {filters}\n\n\
+             Filter(s): {filters}\n\
+             {per_entity}\n\n\
              This round tried these searches:\n{tried_list}\n\n\
              These results came back for the searches above and were judged \
              off-target:\n{rejected_list}\n\n\
@@ -13322,6 +14225,7 @@ impl Scout {
             entity_type = entity_type,
             anchors = anchors,
             filters = filters,
+            per_entity = per_entity,
             tried_list = tried_list,
             rejected_list = rejected_list,
         );
@@ -13438,6 +14342,18 @@ impl Scout {
         // rather than silently for the other kind.
         let ask = |o: &Out| -> FieldAsk {
             if o.kind != "determination" {
+                return FieldAsk::Stated;
+            }
+            // A field the regex path recognises — an email, a URL, a phone —
+            // is a copyable value by construction. Classified a yes/no
+            // determination, `website` came back "yes"/"no" instead of an
+            // address and never reached the candidate extractor (measured
+            // 2026-09-30, Q3 rerun).
+            if cands::kind_for_field(field).is_some() {
+                tracing::debug!(
+                    field = field,
+                    "contact-shaped field classified as a determination; treating as stated"
+                );
                 return FieldAsk::Stated;
             }
             let q = o.question.trim();
@@ -13583,6 +14499,7 @@ mod tests {
             supports: 0.9,
             injection: 0.0,
             currency: 1.0,
+            part_support: Vec::new(),
         }
     }
 
@@ -14558,6 +15475,109 @@ mod tests {
     /// topic folded the whole request into the topic; the q84 topic carried
     /// its constraint as a trailing "with" clause.
     #[test]
+    fn a_source_field_names_where_its_neighbour_was_read() {
+        let f = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let fields = f(&["name", "website", "election_year", "source"]);
+        assert_eq!(
+            provenance_target(&fields, "name", 3).as_deref(),
+            Some("election_year")
+        );
+        let fields = f(&["name", "email", "website_source_url", "website"]);
+        assert_eq!(
+            provenance_target(&fields, "name", 2).as_deref(),
+            Some("website")
+        );
+        assert_eq!(provenance_target(&fields, "name", 1), None);
+        // A lone source after the entity refers to the entity's own record.
+        let fields = f(&["name", "source"]);
+        assert_eq!(
+            provenance_target(&fields, "name", 1).as_deref(),
+            Some("name")
+        );
+        // An open-source field is not a provenance field.
+        let fields = f(&["name", "open_source"]);
+        assert_eq!(provenance_target(&fields, "name", 1), None);
+    }
+
+    #[test]
+    fn the_judge_decides_whether_an_anchor_bearing_constraint_names_a_set() {
+        let mut m = mission_with(
+            "professional colleges in Aragón holding Junta de Gobierno elections in 2026 or 2027",
+            &["will hold Junta de Gobierno elections in 2026 or 2027"],
+            &["name"],
+        );
+        m.anchors = vec!["Junta de Gobierno".into()];
+        m.unlistable_constraints = vec![true];
+        // Token rule alone: an anchor token is present, so it "names the set"
+        // and stays in the discovery goal.
+        assert!(constraint_names_the_set(&m, &m.constraints[0].clone()));
+        assert!(discovery_goal(&m).contains("criterion"));
+        // The judge says it names no published set: the unlistable verdict
+        // stands and the goal drops it.
+        m.set_defining = vec![Some(false)];
+        assert!(!constraint_names_the_set(&m, &m.constraints[0].clone()));
+        assert!(
+            !discovery_goal(&m).contains("criterion"),
+            "{}",
+            discovery_goal(&m)
+        );
+        // A set the judge confirms keeps the q81 behaviour.
+        m.set_defining = vec![Some(true)];
+        assert!(constraint_names_the_set(&m, &m.constraints[0].clone()));
+    }
+
+    #[test]
+    fn an_unlistable_constraint_is_cut_out_of_the_listing_core() {
+        let mut m = mission_with(
+            "professional colleges in Aragón holding Junta de Gobierno elections in 2026 or 2027",
+            &[
+                "located in Aragón, Spain",
+                "will hold Junta de Gobierno elections in 2026 or 2027",
+            ],
+            &["name", "website", "election_year"],
+        );
+        m.entity_type = "professional colleges".into();
+        m.unlistable_constraints = vec![false, true];
+        let cands = listing_core_candidates(&m.topic);
+        assert_eq!(
+            core_without_unlistable(&m, &cands).as_deref(),
+            Some("professional colleges in Aragón")
+        );
+        // Every constraint listable: the judge's pick stands.
+        m.unlistable_constraints = vec![false, false];
+        assert!(core_without_unlistable(&m, &cands).is_none());
+    }
+
+    /// q62: the only cut free of the condition is the bare entity type, which
+    /// identifies no list; the judge's pick stands.
+    #[test]
+    fn the_bare_entity_type_is_never_the_reconciled_core() {
+        let mut m = mission_with(
+            "municipalities that ran online consultations in 2025",
+            &["ran online consultations in 2025"],
+            &["name"],
+        );
+        m.entity_type = "municipalities".into();
+        m.unlistable_constraints = vec![true];
+        let cands = listing_core_candidates(&m.topic);
+        assert!(core_without_unlistable(&m, &cands).is_none(), "{cands:?}");
+    }
+
+    #[test]
+    fn listing_core_candidates_cut_before_a_participle() {
+        let q3 = listing_core_candidates(
+            "professional colleges in Aragón holding Junta de Gobierno elections in 2026 or 2027",
+        );
+        assert!(
+            q3.contains(&"professional colleges in Aragón".to_string()),
+            "missing clean core: {q3:?}"
+        );
+        // Short -ing words and the first word are not cuts.
+        assert!(listing_core_candidates("king penguins in zoos").is_empty());
+        assert!(listing_core_candidates("mining companies in Chile").is_empty());
+    }
+
+    #[test]
     fn listing_core_candidates_cut_at_clause_markers() {
         let q63 = listing_core_candidates(
             "organizations using Decidim that ran a vote in 2025 and the organization responsible for managing that vote",
@@ -14837,6 +15857,35 @@ mod tests {
             "software ag",
             "software companies"
         ));
+    }
+
+    #[test]
+    fn near_collision_ignores_tokens_common_across_the_store() {
+        let keys: Vec<String> = [
+            "colegio oficial de geologos de aragon",
+            "colegio oficial de medicos de zaragoza",
+            "ilustre colegio oficial de medicos de zaragoza",
+            "colegio profesional de trabajo social de aragon",
+            "colegio oficial de economistas de aragon",
+            "colegio notarial de zaragoza",
+            "colegio oficial de farmaceuticos de zaragoza",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let common = common_name_tokens(&keys);
+        assert!(
+            common.contains("colegio") && common.contains("de"),
+            "{common:?}"
+        );
+        // Different professions share only category words: not a candidate.
+        assert!(!near_collision_in(&keys[0], &keys[1], &common));
+        assert!(!near_collision_in(&keys[3], &keys[4], &common));
+        assert!(!near_collision_in(&keys[5], &keys[6], &common));
+        // A decorated variant of one college still is.
+        assert!(near_collision_in(&keys[1], &keys[2], &common));
+        // Raw tokens alone would have paired the different professions.
+        assert!(near_collision(&keys[0], &keys[1]) || near_collision(&keys[3], &keys[4]));
     }
 
     #[test]
@@ -16104,9 +17153,10 @@ mod tests {
         // Date found (0.95), link not (0.10): the holistic 0.9 must not win.
         let combined = answered_across_parts(0.9, &[Some(0.95), Some(0.10)]);
         assert!((combined - 0.10).abs() < 1e-9, "{combined}");
-        // Every part found: the holistic verdict governs.
-        let combined = answered_across_parts(0.8, &[Some(0.95), Some(0.9)]);
-        assert!((combined - 0.8).abs() < 1e-9, "{combined}");
+        // Every part judged: the parts decide, the holistic verdict (which
+        // cannot credit a derived part) does not drag them down.
+        let combined = answered_across_parts(0.4, &[Some(0.95), Some(0.9)]);
+        assert!((combined - 0.9).abs() < 1e-9, "{combined}");
         // A failed part ask is not a pass.
         assert_eq!(answered_across_parts(0.9, &[Some(0.95), None]), 0.0);
         // A single-fact mission has no parts and behaves exactly as before.
@@ -17272,36 +18322,149 @@ mod tests {
     #[test]
     fn screen_verdict_applies_the_gates_in_order() {
         let t = Tunables::default();
+        let sc = |injection: f64, supports: f64, currency: f64, parts: Vec<f64>| Screened {
+            injection,
+            supports,
+            currency,
+            parts,
+        };
         // Injection outranks everything: supportive, current text is still
         // withheld when it addresses the model.
         assert_eq!(
-            screen_verdict(&t, &(0.9, 0.9, 1.0)),
+            screen_verdict(&t, &sc(0.9, 0.9, 1.0, vec![])),
             ScreenVerdict::Quarantined
         );
-        // Staleness drops before support is even judged.
-        assert_eq!(screen_verdict(&t, &(0.1, 0.9, 0.1)), ScreenVerdict::Stale);
-        assert_eq!(screen_verdict(&t, &(0.1, 0.8, 1.0)), ScreenVerdict::Kept);
         assert_eq!(
-            screen_verdict(&t, &(0.1, 0.2, 1.0)),
+            screen_verdict(&t, &sc(0.1, 0.8, 1.0, vec![])),
+            ScreenVerdict::Kept
+        );
+        assert_eq!(
+            screen_verdict(&t, &sc(0.1, 0.2, 1.0, vec![])),
             ScreenVerdict::NotSupportive
         );
     }
 
-    /// The floor is deliberately low: the `cur{slot}` noul asks about
-    /// contradiction with today, not freshness, so only passages Jev is fairly
-    /// sure are superseded are discarded. Everything else is merely reordered.
+    /// Measured 2026-09-30: ANFAC's own appointment release scored support
+    /// 0.94 and currency 0.05, and was the only source of "since when". A
+    /// superseded passage is history, never dropped for it.
     #[test]
-    fn currency_floor_drops_only_the_clearly_superseded() {
+    fn a_dated_passage_is_kept_not_dropped() {
         let t = Tunables::default();
-        assert!((t.currency_floor - 0.25).abs() < 1e-12);
-        assert!(0.30 >= t.currency_floor, "a middling passage survives");
-        assert!(
-            0.10 < t.currency_floor,
-            "a clearly stale passage is dropped"
-        );
-        // Never so high that it competes with the support threshold — that
-        // would silently turn the answer path into a recency filter.
+        let s = Screened {
+            injection: 0.24,
+            supports: 0.94,
+            currency: 0.05,
+            parts: vec![],
+        };
+        assert_eq!(screen_verdict(&t, &s), ScreenVerdict::Kept);
+        // Still labelled for the writer, and never so high that it competes
+        // with the support threshold.
+        assert!(s.currency < t.currency_floor);
         assert!(t.currency_floor < t.keep_support);
+    }
+
+    /// A footer stating only the phone number scores low against a six-part
+    /// question as a whole; its part keeps it.
+    #[test]
+    fn a_passage_answering_one_part_is_kept() {
+        let t = Tunables::default();
+        let footer = Screened {
+            injection: 0.1,
+            supports: 0.2,
+            currency: 1.0,
+            parts: vec![0.05, 0.9, 0.1],
+        };
+        assert_eq!(screen_verdict(&t, &footer), ScreenVerdict::Kept);
+        let nav = Screened {
+            parts: vec![0.05, 0.1, 0.1],
+            ..footer
+        };
+        assert_eq!(screen_verdict(&t, &nav), ScreenVerdict::NotSupportive);
+    }
+
+    fn part_passage(url: &str, supports: f64, parts: Vec<f64>) -> Passage {
+        let mut p = passage(url, 10);
+        p.supports = supports;
+        p.part_support = parts;
+        p
+    }
+
+    /// Ranked by whole-question support alone, the dean's page took every
+    /// slot and the member count's only passage was cut (ICAB, 2026-09-30).
+    #[test]
+    fn select_evidence_reserves_a_slot_for_every_part() {
+        let mut ev: Vec<Passage> = (0..6)
+            .map(|i| part_passage(&format!("https://dean{i}.org"), 0.95, vec![0.9, 0.0]))
+            .collect();
+        ev.push(part_passage("https://members.org", 0.3, vec![0.0, 0.85]));
+        let picked = select_evidence(&ev, 2, 3, 3, 0.45);
+        assert_eq!(picked.len(), 3);
+        assert!(
+            picked.iter().any(|p| p.url == "https://members.org"),
+            "the only passage for part 1 must be selected"
+        );
+    }
+
+    #[test]
+    fn select_evidence_round_robins_before_second_slots() {
+        let ev = vec![
+            part_passage("https://a.org", 0.9, vec![0.9, 0.0, 0.0]),
+            part_passage("https://b.org", 0.9, vec![0.8, 0.0, 0.0]),
+            part_passage("https://c.org", 0.5, vec![0.0, 0.7, 0.0]),
+            part_passage("https://d.org", 0.5, vec![0.0, 0.0, 0.7]),
+        ];
+        // Three slots: one per part before part 0 gets its second.
+        let picked: Vec<String> = select_evidence(&ev, 3, 3, 3, 0.45)
+            .into_iter()
+            .map(|p| p.url)
+            .collect();
+        assert!(picked.contains(&"https://a.org".to_string()));
+        assert!(picked.contains(&"https://c.org".to_string()));
+        assert!(picked.contains(&"https://d.org".to_string()));
+    }
+
+    #[test]
+    fn select_evidence_caps_ranked_fill_per_source_and_orders_by_rank() {
+        let mut ev: Vec<Passage> = (0..5)
+            .map(|i| {
+                let mut p = part_passage("https://one.org", 0.9 - i as f64 * 0.01, vec![]);
+                p.text = format!("chunk {i}");
+                p
+            })
+            .collect();
+        ev.push(part_passage("https://two.org", 0.5, vec![]));
+        let picked = select_evidence(&ev, 0, 14, 3, 0.45);
+        assert_eq!(
+            picked.iter().filter(|p| p.url == "https://one.org").count(),
+            3
+        );
+        assert_eq!(picked.len(), 4);
+        assert_eq!(picked[0].text, "chunk 0", "best rank is citation [1]");
+    }
+
+    /// Currency breaks a near-tie between passages covering one part, and
+    /// never outweighs a clearly better part score (ANFAC, 2026-09-30).
+    #[test]
+    fn select_evidence_uses_currency_only_to_break_part_ties() {
+        let mut old = part_passage("https://old.org", 0.9, vec![0.82]);
+        old.currency = 0.1;
+        let new = part_passage("https://new.org", 0.6, vec![0.80]);
+        let picked = select_evidence(&[old.clone(), new.clone()], 1, 1, 3, 0.45);
+        assert_eq!(picked[0].url, "https://new.org", "near-tie: current wins");
+
+        let mut contact = part_passage("https://anfac.com/contacto", 0.73, vec![0.86]);
+        contact.currency = 0.25;
+        let directory = part_passage("https://directory.example", 0.8, vec![0.70]);
+        let picked = select_evidence(&[directory, contact], 1, 1, 3, 0.45);
+        assert_eq!(picked[0].url, "https://anfac.com/contacto");
+    }
+
+    #[test]
+    fn derived_parts_note_asks_for_a_labelled_estimate() {
+        assert!(derived_parts_writer_note(&[]).is_none());
+        let note = derived_parts_writer_note(&["next_election_date".to_string()]).unwrap();
+        assert!(note.contains("next election date"), "{note}");
+        assert!(note.contains("estimate"), "{note}");
     }
 
     /// A `Passage` deserialized from an older report (written before the field
@@ -17335,6 +18498,41 @@ mod tests {
         for w in claims.windows(2) {
             assert!(w[0].end <= w[1].start, "claims overlap: {:?}", w);
         }
+    }
+
+    #[test]
+    fn an_answer_that_admits_a_gap_is_detected() {
+        assert!(answer_admits_a_gap(
+            "The DG is José López-Tafall [1]. The provided sources do not settle the email."
+        ));
+        assert!(answer_admits_a_gap(
+            "*   **Email:** This was not found in the sources."
+        ));
+        assert!(!answer_admits_a_gap(
+            "The profile is as follows:\n*   **Members:** 24,000 [2]."
+        ));
+        // Cited or not, saying the sources lack it is an admission.
+        assert!(answer_admits_a_gap(
+            "The provided sources do not contain the published email [2]."
+        ));
+        assert!(!answer_admits_a_gap(
+            "The DG took office in March 2020 [3]."
+        ));
+    }
+
+    #[test]
+    fn split_claims_skips_lead_ins_and_statements_about_the_sources() {
+        let a = "The profile of ICAB is as follows:\n\
+                 *   **Members:** More than 24,000 [9].\n\
+                 *   **General contact email:** This was not found in the sources.\n\
+                 The sources do not name a CEO; the board chair is Ana Pérez [2].";
+        let claims: Vec<String> = split_claims(a).into_iter().map(|c| c.text).collect();
+        assert_eq!(claims.len(), 2, "{claims:?}");
+        assert!(claims[0].contains("24,000"));
+        assert!(
+            claims[1].contains("Ana Pérez"),
+            "a cited sentence is always checked"
+        );
     }
 
     #[test]

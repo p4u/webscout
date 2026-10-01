@@ -147,7 +147,14 @@ fn records_table(report: &ScoutReport) -> String {
         return s;
     }
     let cols = columns(report);
-    let _ = writeln!(s, "| # | {} | source | grounding |", cols.join(" | "));
+    // `status` says why a row is not complete (see `scout::record_status`):
+    // a list cut to the requested count shows the incomplete rows after the
+    // complete ones, and without it they read as results.
+    let _ = writeln!(
+        s,
+        "| # | {} | source | grounding | status |",
+        cols.join(" | ")
+    );
     // The delimiter row must have exactly as many cells as the header —
     // `#`, one per field, `source`, `grounding` — or GFM does not treat
     // the block as a table at all and every renderer prints the raw
@@ -155,7 +162,7 @@ fn records_table(report: &ScoutReport) -> String {
     // previous line emitted `|---|---|---||---|---|` for two fields, a
     // 6-cell row with a doubled pipe against a 5-cell header, and no
     // table appeared in the UI.
-    let _ = writeln!(s, "|{}", "---|".repeat(cols.len() + 3));
+    let _ = writeln!(s, "|{}", "---|".repeat(cols.len() + 4));
     for (i, r) in report.records.iter().enumerate() {
         let values: Vec<String> = cols
             .iter()
@@ -177,11 +184,12 @@ fn records_table(report: &ScoutReport) -> String {
             .collect();
         let _ = writeln!(
             s,
-            "| {} | {} | [link]({}) | {:.2} |",
+            "| {} | {} | [link]({}) | {:.2} | {} |",
             i + 1,
             values.join(" | "),
             r.source_url,
-            r.grounding
+            r.grounding,
+            escape_pipes(&crate::scout::record_status(r, &report.mission))
         );
     }
     s
@@ -297,7 +305,13 @@ fn render_terminal(report: &ScoutReport) -> String {
                 .filter(|p| !p.is_empty())
                 .collect();
             let _ = writeln!(s, "{:>4}. {}", i + 1, primary.join("  |  "));
-            let _ = writeln!(s, "      {} (grounding {:.2})", r.source_url, r.grounding);
+            let _ = writeln!(
+                s,
+                "      {} (grounding {:.2}; {})",
+                r.source_url,
+                r.grounding,
+                crate::scout::record_status(r, &report.mission)
+            );
         }
         if !report.records.is_empty() {
             let _ = writeln!(
@@ -449,6 +463,7 @@ mod tests {
                 constraints: vec![],
                 constraint_glosses: vec![],
                 unlistable_constraints: vec![],
+                set_defining: vec![],
                 listing_core: String::new(),
                 simple: false,
                 entity_field: "name".into(),

@@ -92,6 +92,21 @@ pub struct Mission {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unlistable_constraints: Vec<bool>,
 
+    /// Per constraint, parallel to `constraints`: Jev's verdict that a
+    /// constraint carrying an anchor token names one specific published set
+    /// (a grant call, an award, an edition) whose own list enumerates exactly
+    /// the qualifying entities. `None` where it was not asked (no anchor
+    /// token, or the ask failed): the token rule alone decides, as before.
+    ///
+    /// The token rule cannot tell "awarded grants in the CDTI NEOTEC 2024
+    /// call" (anchor "CDTI NEOTEC 2024": a set with its own list) from "will
+    /// hold Junta de Gobierno elections in 2026 or 2027" (anchor "Junta de
+    /// Gobierno": a generic body name). Measured 2026-09-30 (Q3): the second
+    /// was kept in every discovery goal as "set-defining", triage kept
+    /// election notices and rejected the registers, and the run found 2 of 10.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub set_defining: Vec<Option<bool>>,
+
     /// The name of the list a directory, register, or member page would
     /// publish for this mission — the topic stripped of any conditions on
     /// the items ("organizations using Decidim" rather than "organizations
@@ -290,10 +305,21 @@ pub struct Passage {
     /// Only asked for time-sensitive missions (`Mission::time_sensitive`), because
     /// it costs one extra question per chunk; everything else keeps the default
     /// 1.0 and the ranking reduces exactly to `supports`. Used as a ranking
-    /// multiplier so current evidence reaches the writer first, and as a floor
-    /// (`Tunables::currency_floor`) below which the passage is dropped outright.
+    /// multiplier so current evidence reaches the writer first; below
+    /// `Tunables::currency_floor` the writer is told the passage may be
+    /// superseded. It is never dropped for it: a dated passage is exactly the
+    /// evidence for "since when" or "when is the next one" (measured
+    /// 2026-09-30, see `screen_verdict`).
     #[serde(default = "default_one")]
     pub currency: f64,
+
+    /// Jev's probability, per separately-asked part of the question
+    /// (`answer_parts`, same order), that this passage states that part or a
+    /// fact it is worked out from. Empty for a single-part question. Lets a
+    /// passage that answers one part — the phone number in a footer — be kept
+    /// and selected even when it scores low against the question as a whole.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub part_support: Vec<f64>,
 }
 
 /// Where a specific field value was verified: the page it came from and how

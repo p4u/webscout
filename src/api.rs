@@ -622,7 +622,7 @@ pub fn catalogue() -> Vec<OptionGroup> {
                     d.currency_floor,
                     0.0,
                     1.0,
-                    "Minimum currency for a passage to survive on a time-sensitive question.",
+                    "Below this currency a passage on a time-sensitive question is labelled as possibly superseded for the writer (never dropped).",
                 ),
                 num_opt(
                     "query_gate_floor",

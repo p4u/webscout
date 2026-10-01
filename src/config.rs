@@ -564,16 +564,16 @@ pub struct Tunables {
     /// the web must not keep spending planner calls forever.
     pub max_reaims: usize,
 
-    /// Minimum `currency` for a passage to survive on a time-sensitive answer.
+    /// Below this `currency`, a passage on a time-sensitive answer is labelled
+    /// for the writer as possibly describing a superseded state of affairs.
     ///
-    /// A low bar on purpose. The `cur{slot}` noul asks whether the passage
-    /// contradicts today — whether it describes a state of affairs that has since
-    /// changed — not whether it is fresh for its own sake. A 2019 page stating a
-    /// founding date is perfectly current; a 2019 page stating who the current CEO
-    /// is may not be. Set high, this would throw away every older page regardless
-    /// of what it claims, which is the opposite of the intent, so the floor only
-    /// catches passages Jev is fairly sure are stale. Ordering (currency as a
-    /// ranking multiplier) does the rest of the work.
+    /// It used to be a drop floor, and it dropped history the question needed:
+    /// ANFAC's 2020 appointment release (support 0.94, currency 0.05) for
+    /// "since when", ICAB's 2024 annual report for the member count (measured
+    /// 2026-09-30; see `screen_verdict`). The `cur{slot}` noul asks whether the
+    /// passage contradicts today, and an announcement of a past appointment
+    /// does — it is still the evidence of when it happened. Ordering (currency
+    /// as a ranking multiplier) and `pick_most_recent` decide what is current.
     pub currency_floor: f64,
 
     /// Minimum Jev probability that a single claim in the written answer is

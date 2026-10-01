@@ -2130,6 +2130,7 @@ dependencies = [
  "axum",
  "clap",
  "csv",
+ "encoding_rs",
  "futures",
  "pdf-extract",
  "regex",

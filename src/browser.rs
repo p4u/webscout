@@ -1221,7 +1221,8 @@ impl Fetcher {
         }
 
         let final_url = resp.url().to_string();
-        let html = resp.text().await.ok()?;
+        let body = resp.bytes().await.ok()?;
+        let html = decode_html(&body, &ct);
         let text = html_to_text(&html);
 
         // Thin text alongside substantial markup is the signature of a JavaScript
@@ -1796,6 +1797,47 @@ pub fn display_url(url: &str) -> String {
     out.to_string()
 }
 
+/// Decode an HTML body: the `Content-Type` header's charset, else the page's
+/// own `<meta charset>` / `http-equiv` declaration in its first 4 KB, else
+/// UTF-8 when the bytes are valid UTF-8, else Windows-1252.
+///
+/// `Response::text()` falls back to UTF-8 when the header names no charset,
+/// and a Latin-1 page then loses every accented letter. Measured 2026-09-30:
+/// colegiosprofesionalesaragon.com serves `text/html` with
+/// `<meta … charset=iso-8859-1>`, and its member list read "Colegio Oficial
+/// de Farmacuticos de Zaragoza", which did not match the register's
+/// "Farmacéuticos", so one college became two records and was enriched twice.
+pub fn decode_html(bytes: &[u8], content_type: &str) -> String {
+    let label_after = |hay: &str| -> Option<String> {
+        let lower = hay.to_ascii_lowercase();
+        let i = lower.find("charset=")?;
+        let rest = &hay[i + "charset=".len()..];
+        let label: String = rest
+            .trim_start_matches(['"', '\'', ' '])
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+            .collect();
+        (!label.is_empty()).then_some(label)
+    };
+    let from_header = label_after(content_type);
+    let from_meta = || {
+        let head = &bytes[..bytes.len().min(4096)];
+        // Every charset a page can declare is ASCII-compatible in its
+        // declaration, so a lossy view is enough to read the label.
+        label_after(&String::from_utf8_lossy(head))
+    };
+    let encoding = from_header
+        .or_else(from_meta)
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()));
+    match encoding {
+        Some(enc) => enc.decode(bytes).0.into_owned(),
+        None => match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => encoding_rs::WINDOWS_1252.decode(bytes).0.into_owned(),
+        },
+    }
+}
+
 /// A loose identity for a headline, used to keep one syndicated story from
 /// taking five slots.
 ///
@@ -1862,6 +1904,14 @@ pub fn title_key(title: &str) -> String {
 /// ministry's resolution page and two other distinct NEOTEC pages as
 /// "syndicated copies", 232 drops in one run.
 ///
+/// Syndication is a copy on ANOTHER site. Two pages of one organisation that
+/// share a title are distinct pages under a site-wide `<title>`: measured
+/// 2026-09-30 (ICAB), the "Elecciones ICAB 2025" agenda page, the 2024 annual
+/// report PDF and the email-service page were all dropped as copies of a
+/// first ICAB hit, across www/www1/www2 hosts and the .cat/.es domains. So a
+/// title only claims its key against a different site, compared by
+/// `site_stem` (the registrable domain's name, without its suffix).
+///
 /// Ordering is by best original position, ties broken by first appearance, so
 /// a result both engines ranked first stays first.
 pub fn merge_hits(per_lane: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
@@ -1870,7 +1920,8 @@ pub fn merge_hits(per_lane: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
     // (best position, insertion order, hit), keyed by canonical URL.
     let mut merged: Vec<(usize, Hit)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    let mut titles: HashMap<String, usize> = HashMap::new();
+    // Title key -> the site stems already holding it.
+    let mut titles: HashMap<String, Vec<String>> = HashMap::new();
 
     for lane_hits in per_lane {
         for (pos, hit) in lane_hits.into_iter().enumerate() {
@@ -1898,8 +1949,14 @@ pub fn merge_hits(per_lane: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
             }
 
             // See the doc above: only a headline-length key identifies a
-            // story; a two-word programme name is shared by distinct pages.
-            if tkey.split_whitespace().count() >= 4 && titles.contains_key(&tkey) {
+            // story; a two-word programme name is shared by distinct pages;
+            // and only another site's copy is a syndicated one.
+            let stem = site_stem(&hit.url);
+            if tkey.split_whitespace().count() >= 4
+                && titles
+                    .get(&tkey)
+                    .is_some_and(|stems| !stems.contains(&stem))
+            {
                 tracing::debug!(url = %hit.url, "dropping a duplicate title (syndicated copy)");
                 continue;
             }
@@ -1907,7 +1964,10 @@ pub fn merge_hits(per_lane: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
             let slot = merged.len();
             index.insert(key, slot);
             if !tkey.is_empty() {
-                titles.insert(tkey, slot);
+                let stems = titles.entry(tkey).or_default();
+                if !stems.contains(&stem) {
+                    stems.push(stem);
+                }
             }
             merged.push((pos, hit));
         }
@@ -1922,6 +1982,21 @@ pub fn merge_hits(per_lane: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
         out.truncate(limit);
     }
     out
+}
+
+/// The name part of a URL's registrable domain: `www2.icab.cat` and
+/// `icab.es` are both `icab`, `news.bbc.co.uk` is `bbc`. Empty when the URL
+/// does not parse. Used to tell one organisation's pages from another site's
+/// copy of them.
+pub fn site_stem(url: &str) -> String {
+    let Some(host) = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+    else {
+        return String::new();
+    };
+    let reg = crate::scout::registrable_domain(&host);
+    reg.split('.').next().unwrap_or("").to_string()
 }
 
 /// Turn `https://duckduckgo.com/l/?uddg=<encoded>&rut=...` into its destination.
@@ -3131,6 +3206,62 @@ mod tests {
         assert_eq!(merged[0].engines.len(), 2);
         assert_eq!(merged[1].url, "https://b.example/");
         assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn decode_html_honours_the_meta_charset() {
+        // "Farmacéuticos" in Latin-1, no charset in the header.
+        let mut page = b"<html><head><meta http-equiv=\"Content-Type\" content=\"text/html;charset=iso-8859-1\" /></head><body>Farmac".to_vec();
+        page.push(0xE9);
+        page.extend_from_slice(b"uticos</body></html>");
+        assert!(decode_html(&page, "text/html").contains("Farmacéuticos"));
+        // The header wins when it names a charset.
+        assert!(decode_html("é".as_bytes(), "text/html; charset=utf-8").contains('é'));
+        // No declaration at all: valid UTF-8 stays UTF-8, anything else is 1252.
+        assert_eq!(decode_html("Aragón".as_bytes(), "text/html"), "Aragón");
+        assert_eq!(decode_html(&[b'A', 0xF3, b'n'], "text/html"), "Aón");
+    }
+
+    #[test]
+    fn merge_hits_keeps_same_site_pages_that_share_a_title() {
+        let ddg = vec![
+            hit(
+                "Il·lustre Col·legi de l'Advocacia de Barcelona",
+                "https://www.icab.cat/ca/colegi/",
+                "",
+                "ddg",
+            ),
+            hit(
+                "Il·lustre Col·legi de l'Advocacia de Barcelona",
+                "https://www2.icab.cat/export/Memoria-ICAB-2024.pdf",
+                "",
+                "ddg",
+            ),
+            hit(
+                "Il·lustre Col·legi de l'Advocacia de Barcelona",
+                "https://www.icab.es/es/actualidad/agenda/Elecciones-ICAB-2025/",
+                "",
+                "ddg",
+            ),
+            hit(
+                "Il·lustre Col·legi de l'Advocacia de Barcelona",
+                "https://aggregator.example/icab",
+                "",
+                "ddg",
+            ),
+        ];
+        let merged = merge_hits(vec![ddg], 0);
+        let urls: Vec<&str> = merged.iter().map(|h| h.url.as_str()).collect();
+        assert_eq!(merged.len(), 3, "{urls:?}");
+        assert!(!urls.contains(&"https://aggregator.example/icab"));
+    }
+
+    #[test]
+    fn site_stem_folds_hosts_and_suffixes() {
+        assert_eq!(site_stem("https://www2.icab.cat/x"), "icab");
+        assert_eq!(site_stem("https://icab.es/"), "icab");
+        assert_eq!(site_stem("https://news.bbc.co.uk/a"), "bbc");
+        assert_eq!(site_stem("not a url"), "");
     }
 
     #[test]

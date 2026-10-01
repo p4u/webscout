@@ -1522,7 +1522,13 @@ programme or category name ("NEOTEC 2024"), and distinct government pages about
 the same programme legitimately share one; measured on the CDTI NEOTEC harvest
 (2026-09-21), the short-title collision dropped the ministry's resolution page
 and two other distinct NEOTEC pages as "syndicated copies" — 232 drops in a
-single run, including the very list the mission was asking for.
+single run, including the very list the mission was asking for. And only a copy
+on *another site* is syndicated: pages of one organisation often share its
+site-wide `<title>`, so a title claims its key only against a different
+`site_stem` (the registrable domain's name, `icab` for www2.icab.cat and
+icab.es alike). Measured 2026-09-30 on an ICAB profile question: its election
+agenda page, its 2024 annual report and its email-service page were all dropped
+as "copies" of the first ICAB hit.
 
 When two lanes return the same URL their engine sets are unioned into
 `Hit.engines`. The number of agreeing engines is a tiebreak in triage ranking:
