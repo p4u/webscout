@@ -27,6 +27,10 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
 
 # ── Stage 3: the binary ─────────────────────────────────────────────────────
 FROM deps AS builder
+# The commit this image is built from, reported by /api/health so a deploy can
+# be checked. CI passes it; a local build without it reports "unknown".
+ARG WEBSCOUT_COMMIT=unknown
+ENV WEBSCOUT_COMMIT=$WEBSCOUT_COMMIT
 COPY src/ src/
 RUN touch src/main.rs && cargo build --release
 

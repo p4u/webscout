@@ -1051,9 +1051,9 @@ pub fn select_backend(obscura: Option<&Obscura>, jina: Option<&Jina>) -> Result<
 /// Rendered once at completion rather than on demand, because re-running a search
 /// to satisfy a download would be both slow and a different answer.
 #[derive(Debug, Clone)]
-struct CompletedRun {
+pub(crate) struct CompletedRun {
     id: String,
-    formats: BTreeMap<&'static str, String>,
+    pub(crate) formats: BTreeMap<&'static str, String>,
 }
 
 /// The last `MAX_STORED_RUNS` completed runs, oldest evicted first.
@@ -1072,6 +1072,49 @@ impl RunStore {
 
     fn get(&self, id: &str) -> Option<CompletedRun> {
         self.runs.iter().find(|r| r.id == id).cloned()
+    }
+}
+
+/// Most reports kept on disk; the oldest are removed past it.
+const MAX_PERSISTED_REPORTS: usize = 500;
+
+/// A run id usable as a file name: ids are hex plus `-` and a counter, and
+/// anything else (a `/`, a `..`) is refused rather than sanitised.
+fn safe_run_id(id: &str) -> Option<&str> {
+    (!id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then_some(id)
+}
+
+/// Write one report's JSON to `dir`, then prune the oldest files beyond
+/// `MAX_PERSISTED_REPORTS`. Failures only warn: a lost copy must not fail
+/// the run that produced it.
+fn persist_report(dir: &std::path::Path, id: &str, json: &str) {
+    let Some(id) = safe_run_id(id) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(dir)
+        .and_then(|_| std::fs::write(dir.join(format!("{id}.json")), json))
+    {
+        tracing::warn!(error = %e, dir = %dir.display(), "could not keep the report on disk");
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    if files.len() > MAX_PERSISTED_REPORTS {
+        files.sort();
+        for (_, p) in files.iter().take(files.len() - MAX_PERSISTED_REPORTS) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -1141,6 +1184,11 @@ pub struct AppState {
     /// Every finished run, for `/api/stats`. In memory only until
     /// `with_data_dir` names a place for the log.
     pub(crate) stats: crate::stats::StatsStore,
+    /// Where finished reports are kept so `/api/runs/{id}/download` still
+    /// works after a restart (`<data dir>/reports`); `None` without a data
+    /// directory. Every deploy restarts the server, and the in-memory store
+    /// lost the run IDs an evaluation had cited (reported 2026-10-01).
+    reports_dir: Option<std::path::PathBuf>,
     /// UI searches whose run is still going, for `running_now`.
     ui_in_flight: AtomicUsize,
     /// When this process started serving, Unix seconds.
@@ -1170,6 +1218,7 @@ impl AppState {
             ui_dir: None,
             auth: crate::auth::Auth::default(),
             stats: crate::stats::StatsStore::default(),
+            reports_dir: None,
             ui_in_flight: AtomicUsize::new(0),
             started_at: unix_now(),
         }
@@ -1191,6 +1240,7 @@ impl AppState {
     /// Keep the run log in `dir` (loading what is already there); `None`
     /// keeps it in memory only.
     pub fn with_data_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.reports_dir = dir.as_ref().map(|d| d.join("reports"));
         self.stats = match dir {
             Some(d) => crate::stats::StatsStore::open(&d),
             None => {
@@ -1214,10 +1264,26 @@ impl AppState {
 
     /// Keep a finished run's renderings for the download endpoint.
     pub(crate) fn store_run(&self, id: String, formats: BTreeMap<&'static str, String>) {
+        if let (Some(dir), Some(json)) = (&self.reports_dir, formats.get("json")) {
+            persist_report(dir, &id, json);
+        }
         // Sync lock, sync body: never held across an await.
         if let Ok(mut store) = self.runs.lock() {
             store.insert(CompletedRun { id, formats });
         }
+    }
+
+    /// A finished run from the reports directory, re-rendered in every
+    /// format: the fallback when the in-memory store no longer has it.
+    pub(crate) fn load_run(&self, id: &str) -> Option<CompletedRun> {
+        let dir = self.reports_dir.as_ref()?;
+        let path = dir.join(format!("{}.json", safe_run_id(id)?));
+        let text = std::fs::read_to_string(path).ok()?;
+        let report: ScoutReport = serde_json::from_str(&text).ok()?;
+        Some(CompletedRun {
+            id: id.to_string(),
+            formats: render_all(&report),
+        })
     }
 
     /// Build a scout for one request.
@@ -1321,6 +1387,7 @@ impl AppState {
             // The HTTP API does not expose pinned URLs yet; an empty list keeps
             // every request on the search-driven path exactly as before.
             seed_urls: Vec::new(),
+            seen_lines: Default::default(),
         }
         .with_progress(tx))
     }
@@ -1424,8 +1491,16 @@ fn format_name(format: Format) -> &'static str {
 
 // --------------------------------------------------------------- handlers --
 
+/// `commit` is the git commit the binary was built from (`WEBSCOUT_COMMIT` at
+/// build time, set by CI), so a deploy can be verified: `version` alone is the
+/// crate's, unchanged across every build.
 async fn health() -> Response {
-    Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")})).into_response()
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": option_env!("WEBSCOUT_COMMIT").unwrap_or("unknown"),
+    }))
+    .into_response()
 }
 
 async fn options_handler() -> Response {
@@ -1674,6 +1749,8 @@ async fn download(
         };
         store.get(&run_id)
     };
+    // Not in memory (the process restarted): the copy kept on disk.
+    let run = run.or_else(|| state.load_run(&run_id));
     let Some(run) = run else {
         return json_error(
             StatusCode::NOT_FOUND,
@@ -3175,6 +3252,7 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert!(v["commit"].is_string());
     }
 
     #[tokio::test]
@@ -3241,6 +3319,38 @@ mod tests {
             body.contains("max_rounds") && body.contains("200"),
             "{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_persisted_report_survives_the_in_memory_store() {
+        let dir = std::env::temp_dir().join(format!("ws-reports-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let unwrap = |a: Arc<AppState>| Arc::try_unwrap(a).ok().expect("sole owner");
+        let state = unwrap(test_state()).with_data_dir(Some(dir.clone()));
+        let report = crate::types::ScoutReport {
+            query: "q".into(),
+            mission: Default::default(),
+            outcome: crate::types::Outcome::Empty,
+            records: vec![],
+            answer: Some("an answer".into()),
+            evidence: vec![],
+            sources: vec![],
+            quarantined_sources: vec![],
+            notes: vec![],
+            stats: Default::default(),
+        };
+        state.store_run("abc123-0".into(), render_all(&report));
+        assert!(dir.join("reports/abc123-0.json").exists());
+        // A fresh process: nothing in memory, the file is still there.
+        let fresh = unwrap(test_state()).with_data_dir(Some(dir.clone()));
+        let run = fresh.load_run("abc123-0").expect("loaded from disk");
+        assert!(
+            run.formats
+                .get("json")
+                .is_some_and(|j| j.contains("an answer"))
+        );
+        assert!(fresh.load_run("../etc/passwd").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -1094,6 +1094,27 @@ fn parse_wait(args: &Map<String, Value>) -> u64 {
 }
 
 async fn get_search_result(app: &Arc<AppState>, args: &Map<String, Value>) -> Value {
+    // Not among this process's jobs, but kept on disk from before a restart:
+    // the full report, as the JSON download serves it.
+    if let Some(id) = args
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        && app.mcp.find(id).is_none()
+        && let Some(json) = app
+            .load_run(id)
+            .and_then(|r| r.formats.get("json").cloned())
+    {
+        return match serde_json::from_str::<Value>(&json) {
+            Ok(report) => tool_json(json!({
+                "request_id": id,
+                "status": "finished",
+                "note": "Recovered from the server's disk after a restart: the full report.",
+                "report": report,
+            })),
+            Err(_) => tool_error("The stored report could not be read."),
+        };
+    }
     match lookup(app, args) {
         Ok(job) => result_for(job, args, parse_wait(args)).await,
         Err(e) => e,

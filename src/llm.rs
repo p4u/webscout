@@ -262,6 +262,11 @@ pub struct Ask {
     /// (see `STALL_WHITESPACE`). Off by default; enabled where the loop was
     /// measured.
     pub stall_guard: bool,
+    /// Per-attempt deadline, shorter than the client's for small calls. A
+    /// provider that stalls holds a call for the full client timeout (180 s)
+    /// before the retry, and five sequential template calls stalled a list
+    /// run for fifteen minutes before its first round (measured 2026-10-01).
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl Ask {
@@ -275,6 +280,7 @@ impl Ask {
             temperature: 0.3,
             schema: None,
             stall_guard: false,
+            timeout: None,
         }
     }
 
@@ -291,6 +297,7 @@ impl Ask {
             temperature: 0.0,
             schema: Some(schema),
             stall_guard: false,
+            timeout: None,
         }
     }
 
@@ -306,6 +313,11 @@ impl Ask {
 
     pub fn max_tokens(mut self, n: usize) -> Self {
         self.max_tokens = n;
+        self
+    }
+
+    pub fn timeout(mut self, t: std::time::Duration) -> Self {
+        self.timeout = Some(t);
         self
     }
 }
@@ -371,9 +383,9 @@ impl Llm {
             }
 
             let result = if ask.stall_guard {
-                self.attempt_streaming(&body).await
+                self.attempt_streaming(&body, ask.timeout).await
             } else {
-                self.attempt(&body).await
+                self.attempt(&body, ask.timeout).await
             };
             match result {
                 Ok(text) => return Ok(text),
@@ -460,7 +472,11 @@ impl Llm {
     /// stall error and the caller's retry loop tries again. An aborted
     /// stream sends no usage block: its output tokens are estimated and
     /// counted, its cost cannot be (see the note below).
-    async fn attempt_streaming(&self, body: &Value) -> Result<String> {
+    async fn attempt_streaming(
+        &self,
+        body: &Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<String> {
         let mut body = body.clone();
         body["stream"] = json!(true);
         // Without this the stream carries no usage, and cost reporting for
@@ -468,9 +484,11 @@ impl Llm {
         // openrouter.ai 2026-09-24: the final chunk carries usage with cost.
         body["stream_options"] = json!({"include_usage": true});
 
-        let mut resp = self
-            .http
-            .post(&self.endpoint)
+        let mut req = self.http.post(&self.endpoint);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let mut resp = req
             .bearer_auth(&self.api_key)
             .header("HTTP-Referer", "https://github.com/typesafe-ai")
             .header("X-Title", "webscout")
@@ -572,10 +590,12 @@ impl Llm {
         Ok(content)
     }
 
-    async fn attempt(&self, body: &Value) -> Result<String> {
-        let resp = self
-            .http
-            .post(&self.endpoint)
+    async fn attempt(&self, body: &Value, timeout: Option<std::time::Duration>) -> Result<String> {
+        let mut req = self.http.post(&self.endpoint);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let resp = req
             .bearer_auth(&self.api_key)
             // OpenRouter uses these for attribution; other providers ignore them.
             .header("HTTP-Referer", "https://github.com/typesafe-ai")
@@ -658,6 +678,7 @@ impl Llm {
         let prompt = ask.prompt.clone();
         let schema = ask.schema.clone().unwrap_or_else(|| json!({}));
         let guard = ask.stall_guard;
+        let deadline = ask.timeout;
         let attempt = self.chat(ask).await;
         let text = match attempt {
             Ok(t) => t,
@@ -671,8 +692,9 @@ impl Llm {
                     "Return ONLY a JSON object matching this schema, no prose, no code fence:\n\
                      {schema_str}\n\n{prompt}"
                 );
-                self.chat(Ask::prose(framed).thinking(false).stall_guard(guard))
-                    .await?
+                let mut fallback = Ask::prose(framed).thinking(false).stall_guard(guard);
+                fallback.timeout = deadline;
+                self.chat(fallback).await?
             }
             Err(e) => return Err(e),
         };

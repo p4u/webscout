@@ -923,6 +923,17 @@ pub struct Stats {
     /// chained EspoCRM, CiviCRM, ChurchCRM, DayByDayCRM and more into a single
     /// group, and CiviCRM vanished from the output.
     pub category_echoes_dropped: usize,
+
+    /// Harvest: records in the final result, and how many of them meet every
+    /// requirement (`scout::is_complete`). Set once at the end of the run so
+    /// every summary reads the same numbers, whatever slice of the records a
+    /// reader is shown. The summary used to count the rows it was handed:
+    /// "found 1 of the 10 requested" above 84 records, 0 complete (reported
+    /// 2026-10-01).
+    #[serde(default)]
+    pub records_found: usize,
+    #[serde(default)]
+    pub records_complete: usize,
 }
 
 /// Accumulated time and call count for one stage.

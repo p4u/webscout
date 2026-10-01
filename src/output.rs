@@ -359,26 +359,33 @@ fn render_terminal(report: &ScoutReport) -> String {
 /// One plain-language line explaining the outcome.
 pub fn gloss(report: &ScoutReport) -> String {
     let harvest = report.mission.kind == MissionKind::Harvest;
+    // The run's own counts (`Stats::records_found` / `records_complete`), not
+    // the length of whatever slice of the records this report was cut to.
+    let (found, complete) = if report.stats.records_found > 0 {
+        (report.stats.records_found, report.stats.records_complete)
+    } else {
+        (report.records.len(), report.records.len())
+    };
     match report.outcome {
         Outcome::Complete if harvest => {
-            format!("collected {} verified records", report.records.len())
+            format!("collected {complete} verified records")
         }
         Outcome::Complete => "the evidence answers the question".into(),
         // "of the 0 requested" read as nonsense on an open-ended list.
         Outcome::Partial if harvest => match report.mission.target_count {
             Some(target) => format!(
-                "found {} of the {target} requested; the reachable web ran out first",
-                report.records.len()
+                "{complete} of the {target} requested meet every requirement ({found} found; \
+                 the rest are listed with what is missing or unverified)"
             ),
             None => format!(
-                "found {} records; some are missing details or could not be fully verified",
-                report.records.len()
+                "found {found} records, {complete} complete; the rest are missing details or \
+                 could not be fully verified"
             ),
         },
         Outcome::Partial => "part of the question is answered, with gaps remaining".into(),
         Outcome::Truncated => format!(
-            "stopped at the round ceiling with {} records and more still appearing",
-            report.records.len()
+            "stopped at the round ceiling with {found} records ({complete} complete) and more \
+             still appearing"
         ),
         Outcome::Empty if harvest => "nothing verifiable was found".into(),
         Outcome::Empty => {

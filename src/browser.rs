@@ -971,7 +971,22 @@ pub struct Fetcher {
     /// a round our search layer failed: both look like "nothing new", and only
     /// the first is evidence that the run has levelled off.
     lane_failures: std::sync::atomic::AtomicUsize,
+    /// Consecutive search batches that came back empty on every lane, even
+    /// after their retry; sets how long the next retry waits.
+    empty_streak: std::sync::atomic::AtomicUsize,
 }
+
+/// Pauses before re-running a search batch that came back empty everywhere
+/// (see `Fetcher::search_many`), by how many batches in a row already did.
+/// Escalating because a real block outlasts a short pause: measured
+/// 2026-10-01, three concurrent no-cache list runs from one address got
+/// whole 60-query batches back empty from DuckDuckGo, and an 8 s retry came
+/// back empty too.
+const EMPTY_BATCH_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(8),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 
 impl Fetcher {
     pub fn new(backend: Backend, timeout: Duration) -> Result<Self> {
@@ -980,6 +995,7 @@ impl Fetcher {
             lanes,
             search_cache: None,
             lane_failures: std::sync::atomic::AtomicUsize::new(0),
+            empty_streak: std::sync::atomic::AtomicUsize::new(0),
             http: reqwest::Client::builder()
                 .timeout(timeout)
                 // Sites serve very different markup to something that looks like a
@@ -1018,7 +1034,44 @@ impl Fetcher {
     /// A lane that fails or blows its deadline is logged and skipped. It must
     /// never take another lane's results with it, which is the whole reason
     /// each lane gets its own deadline rather than sharing one.
+    ///
+    /// A batch of two or more queries that comes back empty on every lane is
+    /// retried once after `EMPTY_BATCH_RETRY_DELAY`: that is what a throttled
+    /// engine looks like, not what the web looks like, and the round it
+    /// starved counted toward stopping the run. Reported 2026-10-01 on the
+    /// public server: "1 round(s) had every search come back empty … search
+    /// throttling", on the run of a pair that found nothing complete while
+    /// its twin found six.
     pub async fn search_many(&self, queries: &[String], limit: usize) -> Vec<(String, Vec<Hit>)> {
+        use std::sync::atomic::Ordering;
+        let all_empty =
+            |r: &[(String, Vec<Hit>)]| queries.len() >= 2 && r.iter().all(|(_, h)| h.is_empty());
+        let first = self.search_once(queries, limit).await;
+        if !all_empty(&first) || self.lanes.is_empty() {
+            if first.iter().any(|(_, h)| !h.is_empty()) {
+                self.empty_streak.store(0, Ordering::Relaxed);
+            }
+            return first;
+        }
+        let streak = self.empty_streak.load(Ordering::Relaxed);
+        let delay = EMPTY_BATCH_RETRY_DELAYS[streak.min(EMPTY_BATCH_RETRY_DELAYS.len() - 1)];
+        tracing::info!(
+            queries = queries.len(),
+            delay_s = delay.as_secs(),
+            streak,
+            "every search in the batch came back empty; retrying once"
+        );
+        tokio::time::sleep(delay).await;
+        let second = self.search_once(queries, limit).await;
+        if all_empty(&second) {
+            self.empty_streak.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.empty_streak.store(0, Ordering::Relaxed);
+        }
+        second
+    }
+
+    async fn search_once(&self, queries: &[String], limit: usize) -> Vec<(String, Vec<Hit>)> {
         if queries.is_empty() {
             return Vec::new();
         }

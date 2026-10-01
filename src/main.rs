@@ -698,6 +698,7 @@ async fn run(cli: Cli) -> Result<i32> {
         // the progress channel would.
         progress: None,
         seed_urls,
+        seen_lines: Default::default(),
     };
     let report = scout.run(&query).await?;
     scout.fetcher.log_search_cache_summary();
