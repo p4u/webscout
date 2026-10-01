@@ -838,6 +838,17 @@ pub struct Stats {
     #[serde(default)]
     pub planner_cost_usd: Option<f64>,
 
+    /// The extraction model's share of the `llm_*` figures above, which
+    /// count writer and extraction calls together (same endpoint and key,
+    /// and every total that reads `llm_*` stays whole). Separate so a run
+    /// shows what extraction cost when `--extract-model` differs.
+    #[serde(default)]
+    pub extract_requests: usize,
+    #[serde(default)]
+    pub extract_completion_tokens: usize,
+    #[serde(default)]
+    pub extract_cost_usd: Option<f64>,
+
     /// Chunks Jev refused to pass to the generative model.
     pub quarantined: usize,
     /// Records the generative model produced that Jev could not find in the source.

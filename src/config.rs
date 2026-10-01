@@ -28,6 +28,10 @@ pub struct Sources<'a> {
     /// unset. Kept separate because planning benefits from reasoning while
     /// extraction wants a mechanical, cheap model — see P7b in the README.
     pub planner_model: Option<&'a str>,
+    /// Model for extraction calls (records from listing pages, values on
+    /// enrichment pages): the high-volume, mechanical calls. Defaults to the
+    /// writer model. Same endpoint and key as the writer.
+    pub extract_model: Option<&'a str>,
     /// Endpoint for planner calls. Defaults to `llm_endpoint` when unset,
     /// so behaviour is identical to before when the flag is absent.
     pub planner_endpoint: Option<&'a str>,
@@ -47,6 +51,8 @@ pub struct Credentials {
     /// Model used for planning; defaults to `llm_model` when the caller
     /// supplied nothing.
     pub planner_model: String,
+    /// Model for extraction; defaults to `llm_model`.
+    pub extract_model: String,
     /// Endpoint for planner calls; defaults to `llm_endpoint`.
     pub planner_endpoint: String,
     /// API key for the planner endpoint; defaults to `llm_key`.
@@ -108,6 +114,8 @@ impl Credentials {
             .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
         let planner_model =
             pick(s.planner_model, "WEBSCOUT_PLANNER_MODEL").unwrap_or_else(|| llm_model.clone());
+        let extract_model =
+            pick(s.extract_model, "WEBSCOUT_EXTRACT_MODEL").unwrap_or_else(|| llm_model.clone());
 
         let llm_endpoint = pick(s.llm_endpoint, "WEBSCOUT_LLM_ENDPOINT")
             .unwrap_or_else(|| DEFAULT_LLM_ENDPOINT.to_string());
@@ -128,6 +136,7 @@ impl Credentials {
             llm_endpoint,
             llm_model,
             planner_model,
+            extract_model,
             planner_endpoint,
             planner_key,
             jina_key: pick(s.jina_key, "JINA_API_KEY"),

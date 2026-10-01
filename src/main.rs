@@ -276,6 +276,14 @@ struct Cli {
     #[arg(long, value_name = "MODEL")]
     planner_model: Option<String>,
 
+    /// Extraction model name. Falls back to $WEBSCOUT_EXTRACT_MODEL, then to
+    /// `--llm-model`. Used for the high-volume, mechanical calls — records
+    /// from listing pages, field values on enrichment pages — so a list
+    /// search can run a fast, cheap model there while the written answer
+    /// uses a stronger one. Same endpoint and key as the writer.
+    #[arg(long, value_name = "MODEL")]
+    extract_model: Option<String>,
+
     /// Planner endpoint. Falls back to $WEBSCOUT_PLANNER_ENDPOINT, then to
     /// `--llm-endpoint`. Lets you route planning calls to a different host (e.g. a
     /// self-hosted reasoning model) while the writer uses another. Must be the full
@@ -547,6 +555,7 @@ async fn run(cli: Cli) -> Result<i32> {
         llm_endpoint: cli.llm_endpoint.as_deref(),
         llm_model: cli.llm_model.as_deref(),
         planner_model: cli.planner_model.as_deref(),
+        extract_model: cli.extract_model.as_deref(),
         planner_endpoint: cli.planner_endpoint.as_deref(),
         planner_key: cli.planner_key.as_deref(),
         jina_key: cli.jina_key.as_deref(),
@@ -660,6 +669,15 @@ async fn run(cli: Cli) -> Result<i32> {
         tune.http_timeout,
         cli.thinking_control,
     )?;
+    let extractor = Llm::new(
+        creds.llm_endpoint.clone(),
+        creds.llm_key.clone(),
+        creds.extract_model.clone(),
+        tune.max_retries,
+        tune.http_timeout,
+        cli.thinking_control,
+    )?;
+    tracing::debug!(extract_model = %creds.extract_model, "extraction model");
     let planner = Llm::new(
         creds.planner_endpoint.clone(),
         creds.planner_key.clone(),
@@ -686,6 +704,7 @@ async fn run(cli: Cli) -> Result<i32> {
         enrich: !cli.no_enrich,
         jev,
         llm,
+        extractor,
         planner,
         fetcher,
         tune: std::sync::RwLock::new(tune),

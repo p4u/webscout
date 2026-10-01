@@ -170,6 +170,10 @@ pub struct Llm {
     /// Resolved (non-Auto) control — Auto is collapsed to Off or OpenRouter at
     /// construction time so the hot path in `chat` never branches on endpoint strings.
     thinking_control: ThinkingControl,
+    /// Whether schema calls still ask OpenRouter for backends that support
+    /// every parameter; switched off for good after the first "no endpoints"
+    /// answer for this model. Shared by clones.
+    require_parameters: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Deserialize)]
@@ -343,6 +347,7 @@ impl Llm {
             max_retries,
             counters: Arc::new(Counters::default()),
             thinking_control: resolved_control,
+            require_parameters: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -373,6 +378,19 @@ impl Llm {
                 "type": "json_schema",
                 "json_schema": {"name": "output", "strict": true, "schema": schema},
             });
+            // OpenRouter serves a model from several backends, and one that
+            // does not support `response_format` is free to ignore it. Ask
+            // for backends that honour every parameter sent; a suspected
+            // cause of extractions that came back `records: []` in about a
+            // second on text the same prompt extracted fine directly
+            // (2026-09-30). Dropped again if no backend qualifies.
+            if is_openrouter(&self.endpoint)
+                && self
+                    .require_parameters
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                body["provider"] = json!({"require_parameters": true});
+            }
         }
 
         let mut last_err = None;
@@ -420,6 +438,23 @@ impl Llm {
                             effective_thinking = false;
                             apply_thinking_to_body(self.thinking_control, false, &mut body);
                         }
+                        last_err = Some(e);
+                        continue;
+                    }
+                    if body.get("provider").is_some() && is_no_endpoint(&e) {
+                        tracing::info!(
+                            model = %self.model,
+                            "no backend supports every parameter; retrying without the requirement"
+                        );
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("provider");
+                        }
+                        // Once per client: every later call would pay the
+                        // same 404 first (measured 2026-10-02: 8 of 14
+                        // candidate models have no backend accepting both
+                        // `reasoning` and `response_format`).
+                        self.require_parameters
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                         last_err = Some(e);
                         continue;
                     }
@@ -749,6 +784,13 @@ impl Llm {
                 .then(|| usd_from_nano(self.counters.cost_nano_usd.load(Ordering::Relaxed))),
         }
     }
+}
+
+/// OpenRouter's answer when no backend serves the model with every parameter
+/// the request requires.
+fn is_no_endpoint(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}").to_lowercase();
+    m.contains("no endpoints found") || m.contains("no allowed providers")
 }
 
 /// One server-sent event of a streamed completion.

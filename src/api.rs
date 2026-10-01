@@ -695,7 +695,12 @@ pub fn catalogue() -> Vec<OptionGroup> {
                 string_opt(
                     "llm_model",
                     "Writer model",
-                    "Model name for extraction and prose. Blank uses the server's configured model.",
+                    "Model name for the written answer and field templates (and extraction, unless an extraction model is set). Blank uses the server's configured model.",
+                ),
+                string_opt(
+                    "extract_model",
+                    "Extraction model",
+                    "Model name for extracting records and field values from pages: the high-volume calls of a list search. Blank uses the server's configured extraction model, else the writer model.",
                 ),
                 string_opt(
                     "planner_model",
@@ -753,6 +758,7 @@ pub struct RunOptions {
     pub enrich: bool,
     pub llm_model: Option<String>,
     pub planner_model: Option<String>,
+    pub extract_model: Option<String>,
     pub thinking_control: Option<ThinkingControl>,
     pub planner_thinking_control: Option<ThinkingControl>,
 }
@@ -770,6 +776,7 @@ impl Default for RunOptions {
             enrich: true,
             llm_model: None,
             planner_model: None,
+            extract_model: None,
             thinking_control: None,
             planner_thinking_control: None,
         }
@@ -981,6 +988,10 @@ impl RunOptions {
                 "planner_model" => {
                     let s = want_string(spec, v)?;
                     out.planner_model = Some(s).filter(|s| !s.trim().is_empty());
+                }
+                "extract_model" => {
+                    let s = want_string(spec, v)?;
+                    out.extract_model = Some(s).filter(|s| !s.trim().is_empty());
                 }
                 // Unreachable: the unknown-name sweep above already rejected
                 // anything not in the catalogue. Kept as an error rather than a
@@ -1367,6 +1378,25 @@ impl AppState {
             tune.http_timeout,
             planner_tc,
         )?;
+        // A request naming a writer but no extraction model gets its writer
+        // for extraction too, as before the extraction setting existed.
+        let extract_model = opts
+            .extract_model
+            .clone()
+            .or_else(|| {
+                opts.llm_model
+                    .clone()
+                    .filter(|_| self.creds.extract_model == self.creds.llm_model)
+            })
+            .unwrap_or_else(|| self.creds.extract_model.clone());
+        let extractor = Llm::new(
+            self.creds.llm_endpoint.clone(),
+            self.creds.llm_key.clone(),
+            extract_model,
+            tune.max_retries,
+            tune.http_timeout,
+            writer_tc,
+        )?;
 
         let fetcher = Fetcher::new(backend, Duration::from_secs(20))?
             .with_lanes(lanes)
@@ -1378,6 +1408,7 @@ impl AppState {
             enrich: opts.enrich,
             jev,
             llm,
+            extractor,
             planner,
             fetcher,
             tune: std::sync::RwLock::new(tune),
@@ -2156,7 +2187,7 @@ mod tests {
     /// Every option the shared API contract names, in the group it names.
     const SPEC_BASIC: [&str; 2] = ["preset", "format"];
     const SPEC_ADVANCED: [&str; 4] = ["max_rounds", "no_enrich", "no_follow", "no_search_cache"];
-    const SPEC_EXPERT: [&str; 25] = [
+    const SPEC_EXPERT: [&str; 26] = [
         "search_engines",
         "queries_per_round",
         "results_per_query",
@@ -2180,6 +2211,7 @@ mod tests {
         "search_cache_ttl",
         "llm_model",
         "planner_model",
+        "extract_model",
         "thinking_control",
         "planner_thinking_control",
     ];
@@ -2788,6 +2820,7 @@ mod tests {
                 llm_endpoint: "https://api.example/v1/chat/completions".into(),
                 llm_model: "test-model".into(),
                 planner_model: "test-model".into(),
+                extract_model: "test-model".into(),
                 planner_endpoint: "https://api.example/v1/chat/completions".into(),
                 planner_key: "test-key".into(),
                 jina_key: None,

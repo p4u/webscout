@@ -3885,12 +3885,25 @@ const ABBREVIATIONS: &[&str] = &[
 fn answer_admits_a_gap(answer: &str) -> bool {
     // Citation or not: "the provided sources do not contain the email [2]"
     // cites the page it looked at and is still an admission (measured
-    // 2026-09-30, ANFAC: `complete` above exactly that sentence).
+    // 2026-10-01, ANFAC: `complete` above exactly that sentence). But a
+    // sentence that also gives a value is a caveat on an answered part, not
+    // a gap: "More than 24,000 … ; the sources do not give a later figure"
+    // downgraded two complete ICAB answers (measured 2026-10-02, gpt-6-luna
+    // as writer). Judged per sentence, with citation markers removed: a
+    // gap names no number and no address.
+    static CITE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let cite = CITE
+        .get_or_init(|| regex::Regex::new(r"\[\d+(?:\s*[,\]\[]\s*\d+)*\]").expect("static regex"));
     answer
-        .split(['\n', '.'])
-        .map(|t| t.trim().to_lowercase())
-        .filter(|t| !t.is_empty())
-        .any(|t| GAP_MARKERS.iter().any(|m| t.contains(m)))
+        .split('\n')
+        .flat_map(|line| line.split(". "))
+        .map(|t| cite.replace_all(t, "").to_lowercase())
+        .filter(|t| !t.trim().is_empty())
+        .any(|t| {
+            GAP_MARKERS.iter().any(|m| t.contains(m))
+                && !t.chars().any(|c| c.is_ascii_digit())
+                && !t.contains('@')
+        })
 }
 
 /// Phrases with which the writer says a part of the question went
@@ -3914,7 +3927,10 @@ const GAP_MARKERS: &[&str] = &[
 /// citation marker is always checked.
 fn is_meta_claim(text: &str) -> bool {
     let plain = text.trim_end_matches(['*', '_', ' ']);
-    if plain.ends_with(':') {
+    // A Markdown heading ("# Profile of ICAB") is a title, not a claim:
+    // checked as one it came back unsupported and downgraded two complete
+    // answers (measured 2026-10-02, claude-haiku-4.5 as writer).
+    if plain.ends_with(':') || plain.trim_start().starts_with('#') {
         return true;
     }
     let cited = text.contains('[') && text.chars().any(|c| c.is_ascii_digit());
@@ -4517,6 +4533,9 @@ pub struct Scout {
     /// Points at the same model as `llm` when the caller supplied no
     /// override, in which case its stats simply add to the LLM's.
     pub planner: Llm,
+    /// The extraction model (`--extract-model`): records from listing pages
+    /// and values on enrichment pages. Defaults to the writer's model.
+    pub extractor: Llm,
     pub fetcher: Fetcher,
     /// Live tunables. Behind a lock because `--auto` rewrites them mid-run: the
     /// right depth for a search is rarely knowable before you have seen what the
@@ -4713,15 +4732,24 @@ impl Scout {
 
         let (jreq, jtok, jusd) = self.jev.stats();
         let writer = self.llm.stats();
+        let extract = self.extractor.stats();
         let planner = self.planner.stats();
         report.stats.jev_requests = jreq;
         report.stats.jev_input_tokens = jtok;
         report.stats.jev_cost_usd = jusd;
-        report.stats.llm_requests = writer.requests;
-        report.stats.llm_prompt_tokens = writer.prompt_tokens;
-        report.stats.llm_completion_tokens = writer.completion_tokens;
-        report.stats.llm_reasoning_tokens = writer.reasoning_tokens;
-        report.stats.llm_cost_usd = writer.cost_usd;
+        // `llm_*` is writer + extraction (one endpoint, one key), so every
+        // total that reads it stays whole; `extract_*` is the breakdown.
+        report.stats.llm_requests = writer.requests + extract.requests;
+        report.stats.llm_prompt_tokens = writer.prompt_tokens + extract.prompt_tokens;
+        report.stats.llm_completion_tokens = writer.completion_tokens + extract.completion_tokens;
+        report.stats.llm_reasoning_tokens = writer.reasoning_tokens + extract.reasoning_tokens;
+        report.stats.llm_cost_usd = match (writer.cost_usd, extract.cost_usd) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        };
+        report.stats.extract_requests = extract.requests;
+        report.stats.extract_completion_tokens = extract.completion_tokens;
+        report.stats.extract_cost_usd = extract.cost_usd;
         report.stats.planner_requests = planner.requests;
         report.stats.planner_prompt_tokens = planner.prompt_tokens;
         report.stats.planner_completion_tokens = planner.completion_tokens;
@@ -7681,7 +7709,7 @@ impl Scout {
         // seconds instead of running to the token ceiling (see
         // `Llm::attempt_streaming`).
         let out: Extracted = self
-            .llm
+            .extractor
             .structured_ask(crate::llm::Ask::structured(prompt, schema).stall_guard(true))
             .await?;
 
@@ -13383,7 +13411,7 @@ impl Scout {
                     struct Out { value: String }
                     // `Ask::structured` defaults thinking off, which is what
                     // spec B2.3 asks for: extraction is mechanical.
-                    let extracted: Out = match self.llm.structured(prompt, schema).await {
+                    let extracted: Out = match self.extractor.structured(prompt, schema).await {
                         Ok(o) => o,
                         Err(e) => {
                             tracing::debug!(error = %e, "non-regex enrich extraction failed");
@@ -19059,6 +19087,19 @@ mod tests {
         assert!(!answer_admits_a_gap(
             "The DG took office in March 2020 [3]."
         ));
+        // A caveat on an answered part is not a gap.
+        assert!(!answer_admits_a_gap(
+            "- **Members:** More than **24,000** [2]; the sources do not give a later figure."
+        ));
+        assert!(!answer_admits_a_gap(
+            "The next election is estimated for 2029; the sources do not state an exact date [13]."
+        ));
+    }
+
+    #[test]
+    fn split_claims_skips_markdown_headings() {
+        let claims = split_claims("# Profile of ICAB\n\nThe dean is Cristina Vallejo [3].");
+        assert_eq!(claims.len(), 1, "{claims:?}");
     }
 
     #[test]
