@@ -305,6 +305,15 @@
 
           <h3 class="help__subtitle">What your assistant gets</h3>
           <ul class="help__tips" id="connect-tools"></ul>
+
+          <h3 class="help__subtitle">Teach it how to use webscout</h3>
+          <p class="help__intro">The webscout skill tells an assistant how to work with these tools: how to write a good request, wait for long searches, read outcomes, estimates and list statuses, and when to change options.</p>
+          <label class="connect__label" for="connect-skill-cmd">Claude Code: install the skill for every project</label>
+          <div class="connect__row">
+            <input class="field__input connect__url" id="connect-skill-cmd" readonly />
+            <button type="button" class="btn btn--tonal btn--small" data-copy-target="connect-skill-cmd">Copy</button>
+          </div>
+          <p class="field__help">Other assistants: <a id="connect-skill-link" href="/skills/webscout/SKILL.md" download="SKILL.md">download SKILL.md</a> and put it in their skills folder, or paste it into their instructions (for example AGENTS.md). <a href="/skills/webscout/SKILL.md" target="_blank" rel="noopener">Read it</a></p>
         </div>
       </dialog>
 

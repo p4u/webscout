@@ -176,6 +176,16 @@ export function mcpUrl() {
   return `${location.origin}/mcp`;
 }
 
+/** Where this server publishes the webscout skill (ui/public/skills/webscout). */
+export function skillUrl() {
+  return `${location.origin}/skills/webscout/SKILL.md`;
+}
+
+/** One line that installs the skill for Claude Code in every project. */
+export function skillInstallCommand() {
+  return `mkdir -p ~/.claude/skills/webscout && curl -fsSL ${skillUrl()} -o ~/.claude/skills/webscout/SKILL.md`;
+}
+
 export function tokenOrPlaceholder(raw) {
   const t = String(raw ?? '').trim();
   return t || TOKEN_PLACEHOLDER;

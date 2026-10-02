@@ -12,7 +12,14 @@ import {
 import { createControls } from './options.js';
 import { renderMarkdown, renderPlain, wrapTables } from './markdown.js';
 import { EXAMPLE_GROUPS, TIPS } from './examples.js';
-import { CLIENTS, TOOL_NOTES, maskedToken, mcpUrl, tokenOrPlaceholder } from './connect.js';
+import {
+  CLIENTS,
+  TOOL_NOTES,
+  maskedToken,
+  mcpUrl,
+  skillInstallCommand,
+  tokenOrPlaceholder,
+} from './connect.js';
 import { mountStats } from './stats.js';
 
 const $ = (id) => document.getElementById(id);
@@ -88,6 +95,7 @@ const el = {
   connectTabs: $('connect-tabs'),
   connectPanel: $('connect-panel'),
   connectTools: $('connect-tools'),
+  connectSkillCmd: $('connect-skill-cmd'),
   copy: $('copy'),
   downloadTrigger: $('download-trigger'),
   downloadList: $('download-list'),
@@ -1419,6 +1427,7 @@ function useExample(text) {
 
 function renderConnect() {
   el.connectUrl.value = mcpUrl();
+  el.connectSkillCmd.value = skillInstallCommand();
   el.connectTabs.replaceChildren(
     ...CLIENTS.map((c) => {
       const b = document.createElement('button');

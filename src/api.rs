@@ -1996,7 +1996,9 @@ fn content_type_of(path: &std::path::Path) -> &'static str {
         "ico" => "image/x-icon",
         "webp" => "image/webp",
         "woff2" => "font/woff2",
-        "txt" => "text/plain; charset=utf-8",
+        // The webscout skill (ui/public/skills/webscout/SKILL.md) opens in
+        // the browser as text; text/markdown makes most browsers download it.
+        "txt" | "md" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
