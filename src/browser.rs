@@ -974,7 +974,29 @@ pub struct Fetcher {
     /// Consecutive search batches that came back empty on every lane, even
     /// after their retry; sets how long the next retry waits.
     empty_streak: std::sync::atomic::AtomicUsize,
+    /// Jina's reader, for pages the backend returned empty or failed on
+    /// (`api::select_backend`); `None` without a key or when Jina is itself
+    /// the backend.
+    fallback: Option<Jina>,
 }
+
+/// The URLs of `urls` with no page in `pages`, or only one whose text is
+/// shorter than `JINA_FALLBACK_MIN_TEXT` — what the Jina fallback reads.
+fn unread_urls(urls: &[String], pages: &[PageContent]) -> Vec<String> {
+    urls.iter()
+        .filter(|u| {
+            !pages.iter().any(|p| {
+                (p.requested_url == **u || p.url == **u)
+                    && p.text.trim().len() >= JINA_FALLBACK_MIN_TEXT
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Below this many characters a rendered page counts as unread and Jina's
+/// reader gets a turn (see `Fetcher::with_jina_fallback`).
+const JINA_FALLBACK_MIN_TEXT: usize = 200;
 
 /// Pauses before re-running a search batch that came back empty everywhere
 /// (see `Fetcher::search_many`), by how many batches in a row already did.
@@ -996,6 +1018,7 @@ impl Fetcher {
             search_cache: None,
             lane_failures: std::sync::atomic::AtomicUsize::new(0),
             empty_streak: std::sync::atomic::AtomicUsize::new(0),
+            fallback: None,
             http: reqwest::Client::builder()
                 .timeout(timeout)
                 // Sites serve very different markup to something that looks like a
@@ -1226,14 +1249,20 @@ impl Fetcher {
         tracing::debug!(urls = ?urls, rendering = ?needs_render, "fetch batch split");
 
         let http_count = pages.len();
+        let mut fallback_count = 0usize;
         if !needs_render.is_empty() {
-            pages.extend(self.backend.fetch_many(&needs_render).await);
+            let rendered = self.backend.fetch_many(&needs_render).await;
+            let before = rendered.len();
+            let rendered = self.with_jina_fallback(&needs_render, rendered).await;
+            fallback_count = rendered.len().saturating_sub(before);
+            pages.extend(rendered);
         }
 
         tracing::info!(
             requested = urls.len(),
             http = http_count,
-            rendered = pages.len() - http_count,
+            rendered = pages.len() - http_count - fallback_count,
+            jina = fallback_count,
             ms = started.elapsed().as_millis(),
             "page batch read"
         );
@@ -1243,7 +1272,44 @@ impl Fetcher {
     /// Render exactly these URLs with the browser, skipping the HTTP path.
     /// Used when a page passed triage over HTTP and then yielded nothing.
     pub async fn render_many(&self, urls: &[String]) -> Vec<PageContent> {
-        self.backend.fetch_many(urls).await
+        let rendered = self.backend.fetch_many(urls).await;
+        self.with_jina_fallback(urls, rendered).await
+    }
+
+    /// Use Jina's reader with obscura, not instead of it.
+    pub fn with_fallback(mut self, jina: Option<Jina>) -> Self {
+        self.fallback = jina;
+        self
+    }
+
+    /// `pages` plus a Jina read of every URL in `urls` the backend returned
+    /// nothing or only blank text for. An empty render is dropped in favour
+    /// of Jina's copy when Jina reads it; kept when Jina fails too.
+    async fn with_jina_fallback(
+        &self,
+        urls: &[String],
+        pages: Vec<PageContent>,
+    ) -> Vec<PageContent> {
+        let Some(jina) = &self.fallback else {
+            return pages;
+        };
+        let got = |u: &str, p: &PageContent| p.requested_url == u || p.url == u;
+        let missing = unread_urls(urls, &pages);
+        if missing.is_empty() {
+            return pages;
+        }
+        let read = jina.fetch_many(&missing).await;
+        tracing::info!(
+            missing = missing.len(),
+            read = read.len(),
+            "pages obscura could not read, read through Jina"
+        );
+        let mut out: Vec<PageContent> = pages
+            .into_iter()
+            .filter(|p| !read.iter().any(|r| got(&r.requested_url, p)))
+            .collect();
+        out.extend(read);
+        out
     }
 
     async fn try_http(&self, url: &str) -> Option<PageContent> {
@@ -3036,6 +3102,37 @@ mod tests {
         assert!(bytes > 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unread_urls_are_the_missing_and_the_blank() {
+        let page = |u: &str, text: &str| PageContent {
+            url: format!("{u}/final"),
+            requested_url: u.to_string(),
+            title: String::new(),
+            text: text.to_string(),
+            links: Vec::new(),
+            rendered: true,
+        };
+        let urls: Vec<String> = [
+            "https://a.example",
+            "https://b.example",
+            "https://c.example",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let pages = vec![
+            page("https://a.example", &"real content ".repeat(30)),
+            page("https://b.example", "Loading…"),
+        ];
+        assert_eq!(
+            unread_urls(&urls, &pages),
+            vec![
+                "https://b.example".to_string(),
+                "https://c.example".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

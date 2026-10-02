@@ -318,10 +318,9 @@ struct Cli {
 
     /// Jina API key. Falls back to $JINA_API_KEY.
     ///
-    /// Supplying one switches fetching from a local obscura to Jina's hosted search
-    /// and reader. That moves page rendering off this machine — the largest cost in
-    /// most runs, and CPU-bound — in exchange for a metered dependency. Both handle
-    /// JavaScript-rendered pages; without a key, obscura is used.
+    /// Supplying one adds Jina's search engine beside DuckDuckGo and Jina's reader
+    /// as the fallback for pages obscura returns missing or blank. obscura stays
+    /// the primary fetcher; Jina fetches alone only when obscura is not installed.
     #[arg(long, value_name = "KEY")]
     jina_key: Option<String>,
 
@@ -561,20 +560,19 @@ async fn run(cli: Cli) -> Result<i32> {
         jina_key: cli.jina_key.as_deref(),
     })?;
 
-    // Fetching and searching are separate decisions. A Jina key still means
-    // "fetch through Jina"; it no longer means "and therefore stop asking
-    // DuckDuckGo", which is what the old either/or did — a key silently cost
-    // the run its second engine.
+    // Fetching and searching are separate decisions. A Jina key adds a search
+    // lane and a fallback reader; it never replaces obscura or DuckDuckGo
+    // (see `api::select_backend`).
     let jina = match creds.jina_key.clone() {
         Some(key) => Some(Jina::new(key, cli.fetch_concurrency, tune.page_timeout)?),
         None => None,
     };
 
-    // Obscura is required only when something actually needs it: it fetches
-    // when there is no Jina key, and it drives the DuckDuckGo lane. A Jina
-    // user who pinned --search-engines jina never has to install a browser.
-    let needs_obscura = jina.is_none() || cli.search_engines != SearchEngines::Jina;
-    let obscura = if needs_obscura {
+    // Obscura is the primary fetcher whenever it is installed (with a Jina
+    // key, Jina's reader becomes its fallback) and it drives the DuckDuckGo
+    // lane. It is fatal to lack only when there is no Jina key to fall back
+    // on.
+    let obscura = {
         match Obscura::detect(&cli.obscura_bin, cli.fetch_concurrency, tune.page_timeout) {
             Ok(mut o) => {
                 o.stealth = !cli.no_stealth;
@@ -584,16 +582,21 @@ async fn run(cli: Cli) -> Result<i32> {
             // Fatal only when there is no other way to work.
             Err(e) if jina.is_none() => return Err(e),
             Err(e) => {
-                tracing::warn!(error = %e, "obscura is unavailable; the DuckDuckGo lane is off");
+                tracing::warn!(
+                    error = %e,
+                    "obscura is unavailable; fetching through Jina alone and the DuckDuckGo lane is off"
+                );
                 None
             }
         }
-    } else {
-        None
     };
 
-    let backend = api::select_backend(obscura.as_ref(), jina.as_ref())?;
-    tracing::info!(backend = backend.name(), "fetching pages");
+    let (backend, fallback) = api::select_backend(obscura.as_ref(), jina.as_ref())?;
+    tracing::info!(
+        backend = backend.name(),
+        jina_fallback = fallback.is_some(),
+        "fetching pages"
+    );
 
     // Search lanes: every available one by default, or the single engine the
     // caller pinned for a like-for-like comparison. Shared with the API server so
@@ -694,6 +697,7 @@ async fn run(cli: Cli) -> Result<i32> {
 
     let fetcher = Fetcher::new(backend, std::time::Duration::from_secs(20))?
         .with_lanes(lanes)
+        .with_fallback(fallback)
         .with_search_cache(search_cache);
     // Fail before a single token is spent: a mistyped `--url` that silently
     // dropped would answer a slightly different question than the one asked.

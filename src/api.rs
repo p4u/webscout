@@ -1046,11 +1046,22 @@ pub fn select_lanes(
     Ok(lanes)
 }
 
-/// Which backend fetches pages. Jina wins when present, exactly as on the CLI.
-pub fn select_backend(obscura: Option<&Obscura>, jina: Option<&Jina>) -> Result<Backend> {
-    match (jina, obscura) {
-        (Some(j), _) => Ok(Backend::Jina(j.clone())),
-        (None, Some(o)) => Ok(Backend::Obscura(o.clone())),
+/// Which backend fetches pages, and the Jina reader to fall back on.
+///
+/// Obscura (plain HTTP first, its browser where a page needs one) is the
+/// primary whenever it is installed; a Jina key adds Jina's hosted reader as
+/// the fallback for pages obscura returns empty or fails on — bot walls,
+/// pages its browser cannot render. Jina alone fetches only when obscura is
+/// missing. A key used to replace obscura outright, which is why production
+/// ran without one: Jina-only fetching skipped the HTTP fast path, the PDF
+/// parser and the browser (decided 2026-10-02).
+pub fn select_backend(
+    obscura: Option<&Obscura>,
+    jina: Option<&Jina>,
+) -> Result<(Backend, Option<Jina>)> {
+    match (obscura, jina) {
+        (Some(o), j) => Ok((Backend::Obscura(o.clone()), j.cloned())),
+        (None, Some(j)) => Ok((Backend::Jina(j.clone()), None)),
         (None, None) => anyhow::bail!("no fetch backend is available"),
     }
 }
@@ -1340,7 +1351,7 @@ impl AppState {
             jina.as_ref(),
             tune.search_lane_timeout,
         )?;
-        let backend = select_backend(obscura.as_ref(), jina.as_ref())?;
+        let (backend, fallback) = select_backend(obscura.as_ref(), jina.as_ref())?;
 
         let search_cache = tune
             .search_cache
@@ -1400,6 +1411,7 @@ impl AppState {
 
         let fetcher = Fetcher::new(backend, Duration::from_secs(20))?
             .with_lanes(lanes)
+            .with_fallback(fallback)
             .with_search_cache(search_cache);
 
         Ok(Scout {
@@ -2587,6 +2599,12 @@ mod tests {
         assert!(err.contains("jina") && err.contains("key"), "{err}");
         assert!(select_lanes(SearchEngines::Auto, None, None, d).is_err());
         assert!(select_backend(None, None).is_err());
+        // Without obscura, Jina fetches alone and has nothing to fall back to.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let jina = Jina::new("k".into(), 1, Duration::from_secs(1)).unwrap();
+        let (backend, fallback) = select_backend(None, Some(&jina)).unwrap();
+        assert_eq!(backend.name(), "jina");
+        assert!(fallback.is_none());
     }
 
     #[test]

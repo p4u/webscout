@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **Generative LLM** (OpenRouter Gemma 4 by default, any OpenAI-compatible endpoint) *writes*: plans queries, extracts records, synthesizes prose. It never decides.
 - **TypeSafe Jev** (`src/typesafe.rs`) *judges*: returns calibrated probabilities, never text. Used for triage, injection screening, grounding, and mission-parse checks.
-- **Fetch backend** (`src/browser.rs`): `obscura` driven as a subprocess (default), or Jina's hosted reader when `JINA_API_KEY` is set. The key's presence is the whole switch for *fetching*. **Searching is separate**: `SearchLane`s run concurrently (`ddg` whenever obscura is available, `jina` whenever a key is present), so a Jina key no longer silently turns DuckDuckGo off. Pin one with `--search-engines <auto|ddg|jina>`.
+- **Fetch backend** (`src/browser.rs`): `obscura` driven as a subprocess — plain HTTP first, its browser where a page needs one — whenever it is installed. A `JINA_API_KEY` adds Jina's hosted reader as the **fallback** for pages obscura returns missing or blank (< 200 chars, `Fetcher::with_jina_fallback`, also on `render_many` re-reads); Jina fetches alone only when obscura is missing (`api::select_backend`). The key used to replace obscura outright, and Jina-only reading loses bot-protected sites (README, "Two fetch backends"), so production ran without one (changed 2026-10-02). **Searching is separate**: `SearchLane`s run concurrently (`ddg` whenever obscura is available, `jina` whenever a key is present), so a Jina key no longer silently turns DuckDuckGo off. Pin one with `--search-engines <auto|ddg|jina>`.
 
 Rust owns the loop, the thresholds, and the output. This separation is the design; don't let the LLM make accept/reject decisions or let Jev produce text.
 
@@ -38,7 +38,7 @@ source env
 webscout "who is the current CEO of Vodafone"                  # answer mission
 webscout -f csv "at least 100 cooperative names with emails"   # harvest mission
 webscout -vv --profile -f json "..." > out.json                # logs/summary to stderr, payload to stdout
-env -u JINA_API_KEY webscout "..."                             # force obscura for one run
+env -u JINA_API_KEY webscout "..."                             # no Jina lane and no Jina fallback for one run
 ```
 
 Required: `TYPESAFE_API_KEY`, `WEBSCOUT_LLM_API_KEY`. Flags always beat env vars. Nothing is ever hardcoded into the binary; keep it that way. Obscura runs need `obscura` and `obscura-worker` on PATH (or `--obscura-bin`).

@@ -1431,9 +1431,14 @@ beneficiaries extracted from the official PDF in one 83-second run, grounding
 
 ## Two fetch backends
 
-Fetching runs through obscura by default. **Supplying a Jina key switches to Jina's
-hosted search and reader** — the key's presence is the whole switch, so there is no
-second flag that could contradict it.
+Fetching runs through obscura: plain HTTP first, its browser where a page needs one.
+**Supplying a Jina key adds Jina beside it, not instead of it**: Jina's search engine
+runs alongside DuckDuckGo, and Jina's reader gets one try at any page obscura returned
+missing or blank (under 200 characters). Jina fetches on its own only when obscura is
+not installed. The key used to replace obscura outright; the measurements below are
+why it no longer does — Jina alone came back empty on a bot-protected site obscura
+read, and obscura alone got half the records Jina got from a JavaScript table, so
+neither should run without the other.
 
 |  | obscura (default) | Jina (`--jina-key`) |
 |---|---|---|
